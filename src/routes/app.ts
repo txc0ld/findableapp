@@ -278,6 +278,26 @@ appRoute.use("*", async (c, next) => {
 const APP_JS = `(function() {
   'use strict';
 
+  /* ---- Fix nav links: add shop param for in-app navigation ---- */
+  var shop = new URLSearchParams(window.location.search).get('shop') || '';
+  if (shop) {
+    document.querySelectorAll('nav.nav a').forEach(function(a) {
+      var url = new URL(a.href, window.location.origin);
+      if (!url.searchParams.has('shop')) {
+        url.searchParams.set('shop', shop);
+        a.href = url.toString();
+      }
+    });
+    // Also fix any in-page links to /app/products/
+    document.querySelectorAll('a[href^="/app/products/"]').forEach(function(a) {
+      var url = new URL(a.href, window.location.origin);
+      if (!url.searchParams.has('shop')) {
+        url.searchParams.set('shop', shop);
+        a.href = url.toString();
+      }
+    });
+  }
+
   /* ---- Dashboard: sync products ---- */
   window.findableSyncProducts = async function() {
     var btn = document.getElementById('sync-btn');
@@ -650,8 +670,23 @@ appRoute.use("*", async (c, next) => {
   const idToken = c.req.query("id_token");
 
   if (!idToken) {
-    // No session token — serve bounce page. App Bridge will handle
-    // obtaining a token and reloading the page with id_token.
+    // No id_token — try shop query param for in-app navigation.
+    // If the store already exists, serve the page (read-only is safe).
+    // POST actions still require the session token via Authorization header.
+    const shopParam = c.req.query("shop")?.replace(/^https?:\/\//, "");
+    if (shopParam) {
+      const existingStore = await db.query.stores.findFirst({
+        where: eq(stores.shopifyShop, shopParam),
+      });
+      if (existingStore) {
+        console.log(`[app] No id_token but store exists for ${shopParam} — serving page`);
+        c.set("shopifyStore", existingStore);
+        c.set("shopifyShop", shopParam);
+        return next();
+      }
+    }
+
+    // No token AND no existing store — serve bounce page.
     console.log("[app] No id_token — serving bounce page");
     return c.html(bouncePage(apiKey));
   }
