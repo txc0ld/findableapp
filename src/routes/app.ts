@@ -10,6 +10,7 @@ import { decryptAccessToken } from "../lib/shopify-client";
 import { syncAllProducts, getProductCount, getShopInfo } from "../services/product-sync";
 import { startBulkProductSync } from "../services/bulk-operations";
 import { installScriptTag } from "../services/script-tags";
+import { enqueueScanJob } from "../lib/queue";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -276,6 +277,39 @@ const APP_JS = `(function() {
     btn.textContent = 'Sync Products';
   };
 
+  /* ---- Dashboard: scan store ---- */
+  window.findableScanStore = async function() {
+    var btn = document.getElementById('scan-btn');
+    var status = document.getElementById('sync-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    status.className = 'loading';
+    status.textContent = 'Starting store scan...';
+
+    try {
+      var res = await fetch('/app/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok) {
+        status.className = 'success';
+        status.textContent = 'Scan started! Scanning ' + (data.data.productCount || 0) + ' products. Results will appear shortly.';
+      } else {
+        status.className = 'error';
+        status.textContent = data.error || 'Scan failed. Please try again.';
+      }
+    } catch(e) {
+      status.className = 'error';
+      status.textContent = 'Network error. Please check your connection.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Scan Store';
+  };
+
   /* ---- Settings: install script tags ---- */
   window.findableInstallScriptTag = async function() {
     var btn = document.getElementById('install-script-btn');
@@ -459,6 +493,74 @@ appRoute.post("/sync", async (c) => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  POST /scan  — Trigger AI scan of all synced products              */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/scan", async (c) => {
+  const store = c.get("shopifyStore");
+
+  if (!db) {
+    return c.json({ success: false, error: "Database not configured." }, 503);
+  }
+
+  // Look up all synced products for this store that have a URL
+  const storeProducts = await db
+    .select({ url: products.url })
+    .from(products)
+    .where(eq(products.storeId, store.id));
+
+  const urls = storeProducts.map((p) => p.url).filter(Boolean);
+
+  if (urls.length === 0) {
+    return c.json({
+      success: false,
+      error: "No products synced yet. Sync your products first.",
+    }, 400);
+  }
+
+  // Look up the account email for the scan payload
+  const account = store.accountId
+    ? await db.query.accounts.findFirst({
+        where: eq(accounts.id, store.accountId),
+      })
+    : null;
+  const email = account?.email ?? `${store.shopifyShop ?? "store"}@shop.findable`;
+
+  // Create a scan record
+  const inserted = await db
+    .insert(scans)
+    .values({
+      accountId: store.accountId,
+      storeId: store.id,
+      scanType: "full",
+      status: "queued",
+      urlsInput: urls,
+      pagesTotal: urls.length,
+    })
+    .returning({ id: scans.id });
+
+  const scanRecord = inserted[0];
+  if (!scanRecord) {
+    return c.json({ success: false, error: "Failed to create scan record." }, 500);
+  }
+
+  // Enqueue the scan job
+  await enqueueScanJob({
+    scanId: scanRecord.id,
+    urls,
+    email,
+  });
+
+  return c.json({
+    success: true,
+    data: {
+      scanId: scanRecord.id,
+      productCount: urls.length,
+    },
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  POST /script-tags  — Install script tags                          */
 /* ------------------------------------------------------------------ */
 
@@ -588,6 +690,7 @@ appRoute.get("/", async (c) => {
       </div>
       <div class="actions">
         <button class="btn btn-primary" id="sync-btn" onclick="findableSyncProducts()">Sync Products</button>
+        <button class="btn" id="scan-btn" onclick="findableScanStore()" style="background: #22c55e; color: white;">Scan Store</button>
         <a class="btn btn-secondary" href="${escapeHtml(frontendUrl)}/dashboard" target="_top">Open Full Dashboard</a>
       </div>
       <div id="sync-status"></div>
