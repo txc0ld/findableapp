@@ -1,4 +1,5 @@
-type = "backend"
+name = "FindAble API"
+roles = ["backend"]
 
 [commands]
 dev = "bun --watch src/index.ts"
@@ -6,3 +7,4 @@ dev = "bun --watch src/index.ts"
 [commands.env]
 PORT = "3001"
 BACKEND_PORT = "3001"
+SHOPIFY_API_KEY = "c010253ca5cf76889ab73e474f0d686e"
