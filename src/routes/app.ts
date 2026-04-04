@@ -731,6 +731,27 @@ appRoute.use("*", async (c, next) => {
 /*  POST /sync  — Trigger product sync                                */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/*  POST /cleanup  — Delete all products + issues for this store      */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/cleanup", async (c) => {
+  const store = c.get("shopifyStore");
+  if (!db) return c.json({ success: false, error: "No database" }, 503);
+
+  // Delete issues linked to this store's products
+  const storeProducts = await db.select({ id: products.id }).from(products).where(eq(products.storeId, store.id));
+  for (const p of storeProducts) {
+    await db.delete(issues).where(eq(issues.productId, p.id));
+  }
+  // Delete all products
+  await db.delete(products).where(eq(products.storeId, store.id));
+  // Delete all scans
+  await db.delete(scans).where(eq(scans.storeId, store.id));
+
+  return c.json({ success: true, deleted: storeProducts.length });
+});
+
 appRoute.post("/sync", async (c) => {
   const store = c.get("shopifyStore");
 
