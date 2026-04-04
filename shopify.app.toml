@@ -16,15 +16,7 @@ api_version = "2026-04"
   customer_data_request_url = "https://api.getfindable.au/shopify/webhooks"
   shop_deletion_url = "https://api.getfindable.au/shopify/webhooks"
 
-  [[webhooks.subscriptions]]
-  topics = [
-  "app/uninstalled",
-  "bulk_operations/finish",
-  "products/create",
-  "products/delete",
-  "products/update"
-]
-  uri = "https://api.getfindable.au/shopify/webhooks"
+  # Webhooks registered programmatically in OAuth callback via registerShopifyWebhooks()
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
