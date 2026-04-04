@@ -2109,7 +2109,37 @@ appRoute.post("/products/:id/fix", async (c) => {
 
   const updatedAttrs = { ...attrs, _backup: backup };
 
-  // Update the product record
+  // Update boolean flags based on what was generated
+  const hasGeneratedSchema = aiResult.generatedSchema != null;
+  const hasGeneratedFaq = Array.isArray(aiResult.suggestedFaq) && aiResult.suggestedFaq.length > 0;
+  const descLen = (aiResult.rewrittenDescription ?? product.originalDescription ?? "").length;
+
+  // Re-score with updated flags
+  let schemaScore = 18;
+  if (hasGeneratedSchema || product.hasJsonld) schemaScore += 12;
+  if (product.hasGtin) schemaScore += 10;
+  if (product.hasBrand) schemaScore += 8;
+  if (product.hasShippingSchema) schemaScore += 7;
+  if (product.hasReturnSchema) schemaScore += 7;
+  if (product.hasReviewSchema) schemaScore += 6;
+  if (hasGeneratedFaq || product.hasFaqSchema) schemaScore += 4;
+  if (product.hasVariantsStructured) schemaScore += 4;
+  schemaScore = Math.min(100, schemaScore);
+
+  let llmScore = 22;
+  llmScore += Math.min(26, Math.floor(descLen / 12));
+  if (product.hasBrand) llmScore += 8;
+  if (hasGeneratedFaq || product.hasFaqSchema) llmScore += 12;
+  if (product.hasMaterial || product.hasColor || product.hasSize) llmScore += 10;
+  if (product.hasReviewSchema) llmScore += 10;
+  llmScore = Math.min(100, llmScore);
+
+  // Blend AI AEO score with heuristic LLM score
+  const finalLlmScore = aiResult.aeoScore
+    ? Math.round(aiResult.aeoScore * 0.7 + llmScore * 0.3)
+    : llmScore;
+
+  // Update the product record with AI results + updated scores
   await db
     .update(products)
     .set({
@@ -2122,6 +2152,12 @@ appRoute.post("/products/:id/fix", async (c) => {
       attributeDensity: aiResult.attributeDensity,
       googleCategory: aiResult.googleCategory,
       extractedAttributes: updatedAttrs,
+      // Updated flags
+      hasJsonld: hasGeneratedSchema || product.hasJsonld,
+      hasFaqSchema: hasGeneratedFaq || product.hasFaqSchema,
+      // Updated scores
+      schemaScore,
+      llmScore: finalLlmScore,
     })
     .where(eq(products.id, productId));
 
