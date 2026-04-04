@@ -581,7 +581,7 @@ const APP_JS = `(function() {
       }
 
       // Poll for results
-      status.textContent = 'Running LLM visibility tests (3 prompts)...';
+      status.textContent = 'Running LLM visibility tests (5 prompts)...';
       var report = null;
       for (var attempt = 0; attempt < 30; attempt++) {
         await new Promise(function(r) { setTimeout(r, 2000); });
@@ -1184,7 +1184,7 @@ appRoute.post("/visibility-test", async (c) => {
       const report = await testLlmVisibility({
         brandName,
         productCategory,
-        useCases: ["everyday use", "beginners", "professionals"],
+        useCases: ["everyday use", "beginners", "professionals", "value for money", "sustainability"],
       });
 
       visibilityResults.set(store.id, { status: "complete", data: report });
