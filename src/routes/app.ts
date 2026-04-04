@@ -112,7 +112,11 @@ function renderPage(title: string, content: string, apiKey: string): string {
 
 const appRoute = new Hono<{ Variables: ShopifySessionVariables }>();
 
+// Allow Shopify admin to iframe this app
 appRoute.use("*", async (c, next) => {
+  c.header("Content-Security-Policy", "frame-ancestors https://*.myshopify.com https://admin.shopify.com;");
+  c.res.headers.delete("X-Frame-Options");
+
   if (!db) {
     return c.html("<p>Database not configured.</p>", 503);
   }
