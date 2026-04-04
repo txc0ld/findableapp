@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, desc, and, sql, inArray, or, lt } from "drizzle-orm";
+import { eq, desc, and, sql, inArray, or, lt, isNotNull, gt } from "drizzle-orm";
 
 import { db } from "../db/client";
 import { accounts, stores, products, issues, scans, type Store } from "../db/schema";
@@ -1249,8 +1249,12 @@ appRoute.get("/", async (c) => {
   const store = c.get("shopifyStore");
   const apiKey = env.SHOPIFY_API_KEY ?? "";
   const frontendUrl = env.FRONTEND_URL;
+  const shopDomain = store.shopifyShop ?? store.url ?? "unknown";
+  const shopName = shopDomain.replace(/\.myshopify\.com$/, "");
 
-  // Latest completed scan for this store
+  // ── Queries ──────────────────────────────────────────────────────
+
+  // Latest completed scan
   const latestScan = db
     ? await db.query.scans.findFirst({
         where: and(eq(scans.storeId, store.id), eq(scans.status, "complete")),
@@ -1267,7 +1271,58 @@ appRoute.get("/", async (c) => {
     : [];
   const productCount = productRows[0]?.count ?? 0;
 
-  // Top 5 critical/high issues (unfixed, most recent first)
+  // Products with rewrittenDescription (Step 4 progress)
+  const optimizedRows = db
+    ? await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(products)
+        .where(
+          and(
+            eq(products.storeId, store.id),
+            isNotNull(products.rewrittenDescription),
+          ),
+        )
+    : [];
+  const optimizedCount = optimizedRows[0]?.count ?? 0;
+
+  // Products with schemaScore > 0 (Step 2 progress)
+  const scannedRows = db
+    ? await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(products)
+        .where(
+          and(
+            eq(products.storeId, store.id),
+            gt(products.schemaScore, 0),
+          ),
+        )
+    : [];
+  const scannedCount = scannedRows[0]?.count ?? 0;
+
+  // Issue counts by severity (unfixed only)
+  const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 } as { critical: number; high: number; medium: number; low: number; [key: string]: number };
+  if (db) {
+    const sevRows = await db
+      .select({
+        severity: issues.severity,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(issues)
+      .innerJoin(products, eq(issues.productId, products.id))
+      .where(
+        and(
+          eq(products.storeId, store.id),
+          eq(issues.fixed, false),
+        ),
+      )
+      .groupBy(issues.severity);
+    for (const row of sevRows) {
+      if (row.severity) severityCounts[row.severity] = row.count;
+    }
+  }
+  const totalIssues = severityCounts.critical + severityCounts.high + severityCounts.medium + severityCounts.low;
+
+  // Top 8 issues for display
   const topIssues = db
     ? await db
         .select({
@@ -1283,29 +1338,11 @@ appRoute.get("/", async (c) => {
           and(
             eq(products.storeId, store.id),
             eq(issues.fixed, false),
-            inArray(issues.severity, ["critical", "high"]),
           ),
         )
         .orderBy(desc(issues.createdAt))
-        .limit(5)
+        .limit(8)
     : [];
-
-  // Products needing fixes: aeoScore < 50 or schemaScore < 50
-  const needsFixRows = db
-    ? await db
-        .select({ count: sql<number>`count(*)::int` })
-        .from(products)
-        .where(
-          and(
-            eq(products.storeId, store.id),
-            or(
-              lt(products.aeoScore, 50),
-              lt(products.schemaScore, 50),
-            ),
-          ),
-        )
-    : [];
-  const needsFixCount = needsFixRows[0]?.count ?? 0;
 
   // Entity consistency audit (non-blocking)
   let entityConsistent = true;
@@ -1317,7 +1354,7 @@ appRoute.get("/", async (c) => {
     entityIssueCount = entityResult.issues.length;
     entityPrimaryBrand = entityResult.primaryBrand;
   } catch {
-    // Non-critical — ignore
+    // Non-critical
   }
 
   // Mismatch detection (non-blocking)
@@ -1326,122 +1363,304 @@ appRoute.get("/", async (c) => {
     const mismatchResults = await detectMismatches(store.id);
     mismatchCount = mismatchResults.length;
   } catch {
-    // Non-critical — ignore
+    // Non-critical
   }
 
   const overallScore = latestScan?.scoreOverall ?? 0;
-  const schemaScore = latestScan?.scoreSchema ?? 0;
-  const llmScore = latestScan?.scoreLlm ?? 0;
-  const protocolScore = latestScan?.scoreProtocol ?? 0;
-  const competitiveScore = latestScan?.scoreCompetitive ?? 0;
 
-  const lastSyncTime = latestScan?.completedAt
-    ? new Date(latestScan.completedAt).toLocaleString("en-AU", {
-        dateStyle: "medium",
-        timeStyle: "short",
-      })
-    : "Never";
+  // ── Step completion logic ────────────────────────────────────────
 
-  const issuesHtml = topIssues.length
-    ? topIssues
-        .map(
-          (issue) => `
+  const step1Done = productCount > 0;
+  const step2Done = !!latestScan;
+  const step3Done = step2Done; // accessible once scan exists
+  const step4Progress = optimizedCount;
+  const step5Done = false; // can't auto-detect
+  const step6Done = false; // informational
+  const step7Done = false; // always accessible
+
+  // Determine which step is "current" (first incomplete)
+  let currentStep = 1;
+  if (step1Done) currentStep = 2;
+  if (step1Done && step2Done) currentStep = 3;
+  if (step1Done && step2Done && totalIssues === 0) currentStep = 4;
+  if (step1Done && step2Done && step4Progress >= productCount && productCount > 0) currentStep = 5;
+  // Steps 5-7 don't auto-advance; merchant drives them
+  // If step 3 has issues, stay on 3; if no issues, go to 4
+  // Recalculate: step 3 is "review", step 4 is "fix"
+  if (step1Done && step2Done) {
+    currentStep = 3;
+    if (totalIssues === 0 && scannedCount > 0) currentStep = 4;
+    if (step4Progress >= productCount && productCount > 0) currentStep = 5;
+  }
+
+  // ── Feed URLs ────────────────────────────────────────────────────
+  const themeEditorUrl = `https://admin.shopify.com/store/${escapeHtml(shopName)}/themes/current/editor?context=apps`;
+  const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}`;
+  const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}`;
+  const llmsTxtUrl = `https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}`;
+
+  // ── Helper to render step state ─────────────────────────────────
+  function stepState(num: number): "done" | "current" | "future" {
+    if (num < currentStep) return "done";
+    if (num === currentStep) return "current";
+    return "future";
+  }
+
+  function stepCircle(num: number, label: string): string {
+    const state = stepState(num);
+    const bg = state === "done" ? "#16a34a" : state === "current" ? "#4f46e5" : "#d1d5db";
+    const text = state === "done" ? "#fff" : state === "current" ? "#fff" : "#9ca3af";
+    const labelColor = state === "future" ? "#9ca3af" : "#374151";
+    const icon = state === "done"
+      ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`
+      : `<span style="font-size:13px;font-weight:700;color:${text};">${num}</span>`;
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:4px;min-width:60px;">
+      <div style="width:32px;height:32px;border-radius:50%;background:${bg};display:flex;align-items:center;justify-content:center;">${icon}</div>
+      <span style="font-size:11px;color:${labelColor};font-weight:500;text-align:center;line-height:1.2;">${label}</span>
+    </div>`;
+  }
+
+  function stepConnector(fromNum: number): string {
+    const state = stepState(fromNum);
+    const color = state === "done" ? "#16a34a" : "#e5e7eb";
+    return `<div style="flex:1;height:2px;background:${color};margin-top:16px;min-width:8px;"></div>`;
+  }
+
+  // ── Step content builders ────────────────────────────────────────
+
+  // Step 1: Sync Products
+  const step1Content = stepState(1) === "done"
+    ? `<div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-size:14px;font-weight:500;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        ${productCount} product${productCount !== 1 ? "s" : ""} synced
+      </div>`
+    : `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Pull your products from Shopify so FindAble can analyze them.</p>
+        <button class="btn btn-primary" id="sync-btn" onclick="findableSyncProducts()">Sync Products</button>
+        <div id="sync-status"></div>
+      </div>`;
+
+  // Step 2: Scan & Score
+  const step2Content = stepState(2) === "done"
+    ? `<div style="display:flex;align-items:center;gap:12px;">
+        <span style="font-size:32px;font-weight:800;color:${scoreColor(overallScore)};">${overallScore}</span>
+        <span style="color:#6b7280;font-size:14px;">Overall AEO Score</span>
+      </div>`
+    : stepState(2) === "current"
+    ? `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Analyze your products for AI commerce readiness.</p>
+        <button class="btn btn-primary" id="scan-btn" onclick="findableScanStore()">Scan Store</button>
+        <div id="sync-status"></div>
+      </div>`
+    : `<p style="color:#9ca3af;font-size:14px;margin:0;">Sync products first to unlock scanning.</p>`;
+
+  // Step 3: Review Issues
+  const issuesListHtml = topIssues.length
+    ? topIssues.map((issue) => `
         <div class="issue-row">
-          <span class="severity severity-${issue.severity ?? "medium"}" style="margin-right: 12px;">${escapeHtml(issue.severity ?? "medium")}</span>
-          <span style="flex: 1;">${escapeHtml(issue.title)}</span>
-          <span style="font-size: 12px; color: #9ca3af;">${escapeHtml(issue.dimension ?? "")}</span>
-        </div>`,
-        )
-        .join("")
-    : '<div class="empty">No critical issues found. Run a scan to check your store.</div>';
+          <span class="severity severity-${issue.severity ?? "medium"}" style="margin-right:12px;">${escapeHtml(issue.severity ?? "medium")}</span>
+          <span style="flex:1;font-size:13px;">${escapeHtml(issue.title)}</span>
+          <span style="font-size:11px;color:#9ca3af;">${escapeHtml(issue.dimension ?? "")}</span>
+        </div>`).join("")
+    : "";
+
+  const step3Content = stepState(3) === "future"
+    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Complete a scan first.</p>`
+    : totalIssues === 0 && step2Done
+    ? `<div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-size:14px;font-weight:500;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        No issues found
+      </div>`
+    : `<div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+          ${severityCounts.critical > 0 ? `<div style="display:flex;align-items:center;gap:6px;"><span class="severity severity-critical">${severityCounts.critical} critical</span></div>` : ""}
+          ${severityCounts.high > 0 ? `<div style="display:flex;align-items:center;gap:6px;"><span class="severity severity-high">${severityCounts.high} high</span></div>` : ""}
+          ${severityCounts.medium > 0 ? `<div style="display:flex;align-items:center;gap:6px;"><span class="severity severity-medium">${severityCounts.medium} medium</span></div>` : ""}
+          ${severityCounts.low > 0 ? `<div style="display:flex;align-items:center;gap:6px;"><span class="severity severity-low">${severityCounts.low} low</span></div>` : ""}
+        </div>
+        ${issuesListHtml}
+        ${topIssues.length > 0 ? `<div style="margin-top:12px;"><a href="/app/products" style="color:#4f46e5;font-size:13px;font-weight:500;text-decoration:none;">View all products &rarr;</a></div>` : ""}
+      </div>`;
+
+  // Step 4: Fix Products
+  const step4Content = stepState(4) === "future"
+    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Review issues first.</p>`
+    : `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 12px;">Let AI optimize your product data for better discoverability.</p>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+          <div style="flex:1;background:#e5e7eb;border-radius:99px;height:8px;overflow:hidden;">
+            <div style="width:${productCount > 0 ? Math.round((optimizedCount / productCount) * 100) : 0}%;height:100%;background:#4f46e5;border-radius:99px;transition:width 0.3s;"></div>
+          </div>
+          <span style="font-size:13px;font-weight:600;color:#374151;white-space:nowrap;">${optimizedCount} of ${productCount} optimized</span>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+          <button class="btn btn-primary" id="fix-all-btn" onclick="findableFixAll()">Auto-Fix All Products</button>
+          <a href="/app/products" class="btn btn-secondary">Fix individually</a>
+        </div>
+        <div id="fix-all-status" class="action-status"></div>
+      </div>`;
+
+  // Step 5: Activate Schema
+  const step5Content = stepState(5) === "future"
+    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Fix your products first.</p>`
+    : `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 12px;">Enable rich structured data on your store by activating the FindAble app embed in your Shopify theme.</p>
+        <ol style="color:#4b5563;font-size:13px;margin:0 0 16px;padding-left:20px;line-height:2;">
+          <li>Open your Theme Editor</li>
+          <li>Go to <strong>App Embeds</strong></li>
+          <li>Toggle on <strong>FindAble Schema</strong></li>
+          <li>Save</li>
+        </ol>
+        <a href="${themeEditorUrl}" target="_blank" class="btn btn-primary" style="font-size:13px;">Open Theme Editor &rarr;</a>
+      </div>`;
+
+  // Step 6: Submit Feeds
+  const step6Content = stepState(6) === "future"
+    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Activate schema first.</p>`
+    : `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Get your products into ChatGPT and Google Shopping.</p>
+        <div style="margin-bottom:12px;">
+          <div style="font-size:12px;font-weight:600;color:#6b7280;margin-bottom:4px;">ACP Feed (ChatGPT)</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <code style="flex:1;background:#f3f4f6;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(acpFeedUrl)}</code>
+            <button class="btn btn-secondary" style="padding:8px 12px;font-size:12px;white-space:nowrap;" onclick="navigator.clipboard.writeText('${acpFeedUrl}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500);">Copy</button>
+          </div>
+          <a href="https://chatgpt.com/merchants" target="_blank" style="font-size:12px;color:#4f46e5;text-decoration:none;margin-top:4px;display:inline-block;">Submit to ChatGPT Merchants &rarr;</a>
+        </div>
+        <div style="margin-bottom:12px;">
+          <div style="font-size:12px;font-weight:600;color:#6b7280;margin-bottom:4px;">GMC Feed (Google)</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <code style="flex:1;background:#f3f4f6;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(gmcFeedUrl)}</code>
+            <button class="btn btn-secondary" style="padding:8px 12px;font-size:12px;white-space:nowrap;" onclick="navigator.clipboard.writeText('${gmcFeedUrl}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500);">Copy</button>
+          </div>
+          <a href="https://merchants.google.com/" target="_blank" style="font-size:12px;color:#4f46e5;text-decoration:none;margin-top:4px;display:inline-block;">Open Google Merchant Center &rarr;</a>
+        </div>
+        <div>
+          <div style="font-size:12px;font-weight:600;color:#6b7280;margin-bottom:4px;">llms.txt</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <code style="flex:1;background:#f3f4f6;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(llmsTxtUrl)}</code>
+            <button class="btn btn-secondary" style="padding:8px 12px;font-size:12px;white-space:nowrap;" onclick="navigator.clipboard.writeText('${llmsTxtUrl}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500);">Copy</button>
+          </div>
+        </div>
+      </div>`;
+
+  // Step 7: Monitor
+  const step7Content = stepState(7) === "future"
+    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Complete earlier steps first.</p>`
+    : `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Track your store's AI visibility and health.</p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;">
+          <div style="background:#f9fafb;border-radius:8px;padding:16px;text-align:center;">
+            <div style="font-size:24px;font-weight:700;color:${entityConsistent ? "#16a34a" : "#dc2626"};">${entityConsistent ? "OK" : entityIssueCount}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px;">Entity Consistency</div>
+          </div>
+          <div style="background:#f9fafb;border-radius:8px;padding:16px;text-align:center;">
+            <div style="font-size:24px;font-weight:700;color:${mismatchCount === 0 ? "#16a34a" : "#dc2626"};">${mismatchCount}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px;">Mismatches</div>
+          </div>
+          ${entityPrimaryBrand ? `<div style="background:#f9fafb;border-radius:8px;padding:16px;text-align:center;">
+            <div style="font-size:16px;font-weight:700;color:#374151;">${escapeHtml(entityPrimaryBrand)}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px;">Primary Brand</div>
+          </div>` : ""}
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+          <button class="btn" id="visibility-btn" onclick="findableTestVisibility()" style="background:#7c3aed;color:white;">Test LLM Visibility</button>
+        </div>
+        <div id="visibility-status" style="display:none;margin-top:8px;padding:8px 12px;border-radius:6px;font-size:13px;"></div>
+        <div id="visibility-results"></div>
+      </div>`;
+
+  // ── Build step card ──────────────────────────────────────────────
+
+  const stepLabels = ["Sync", "Scan", "Review", "Fix", "Schema", "Feeds", "Monitor"];
+  const stepTitles = [
+    "Sync Products",
+    "Scan & Score",
+    "Review Issues",
+    "Fix Products",
+    "Activate Schema",
+    "Submit Feeds",
+    "Monitor",
+  ];
+  const stepDescriptions = [
+    "Pull your products from Shopify",
+    "Analyze your products for AI commerce readiness",
+    "See what's holding your products back",
+    "Let AI optimize your product data",
+    "Enable rich structured data on your store",
+    "Get your products into ChatGPT and Google Shopping",
+    "Track LLM visibility and store health",
+  ];
+  const stepContents = [step1Content, step2Content, step3Content, step4Content, step5Content, step6Content, step7Content];
+
+  // Build progress tracker
+  let trackerHtml = `<div style="display:flex;align-items:flex-start;justify-content:center;gap:0;padding:8px 0;overflow-x:auto;">`;
+  for (let i = 1; i <= 7; i++) {
+    trackerHtml += stepCircle(i, stepLabels[i - 1]!);
+    if (i < 7) trackerHtml += stepConnector(i);
+  }
+  trackerHtml += `</div>`;
+
+  // Build step cards
+  let stepsHtml = "";
+  for (let i = 1; i <= 7; i++) {
+    const state = stepState(i);
+    const borderColor = state === "current" ? "#4f46e5" : state === "done" ? "#e5e7eb" : "#f3f4f6";
+    const bgColor = state === "current" ? "#fafbff" : "#ffffff";
+    const opacity = state === "future" ? "0.6" : "1";
+    const borderWidth = state === "current" ? "2px" : "1px";
+
+    stepsHtml += `
+      <div style="border:${borderWidth} solid ${borderColor};border-radius:12px;padding:20px;margin-bottom:12px;background:${bgColor};opacity:${opacity};transition:all 0.2s;">
+        <div style="display:flex;align-items:center;gap:12px;${state !== "current" && state !== "done" ? "cursor:default;" : ""}">
+          <div style="width:28px;height:28px;border-radius:50%;background:${state === "done" ? "#16a34a" : state === "current" ? "#4f46e5" : "#d1d5db"};display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            ${state === "done"
+              ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`
+              : `<span style="font-size:13px;font-weight:700;color:${state === "current" ? "#fff" : "#9ca3af"};">${i}</span>`}
+          </div>
+          <div style="flex:1;">
+            <div style="font-size:15px;font-weight:600;color:${state === "future" ? "#9ca3af" : "#1a1a1a"};">${stepTitles[i - 1]}</div>
+            ${state !== "current" ? `<div style="font-size:13px;color:#6b7280;margin-top:2px;">${stepDescriptions[i - 1]}</div>` : ""}
+          </div>
+        </div>
+        ${state === "current" ? `
+          <div style="margin-top:16px;padding-top:16px;border-top:1px solid #e5e7eb;">
+            <p style="color:#6b7280;font-size:13px;margin:0 0 16px;">${stepDescriptions[i - 1]}</p>
+            ${stepContents[i - 1]}
+          </div>
+        ` : ""}
+        ${state === "done" ? `
+          <div style="margin-top:8px;padding-left:40px;">
+            ${stepContents[i - 1]}
+          </div>
+        ` : ""}
+      </div>`;
+  }
+
+  // Overall score hero (only show after scan)
+  const scoreHeroHtml = latestScan ? `
+    <div class="card" style="text-align:center;padding:32px 24px;">
+      <div style="font-size:64px;font-weight:800;color:${scoreColor(overallScore)};line-height:1;">${overallScore}</div>
+      <div style="font-size:14px;color:#6b7280;margin-top:8px;">Overall AEO Score</div>
+      <div style="display:flex;justify-content:center;gap:24px;margin-top:20px;">
+        <div><span style="font-size:22px;font-weight:700;color:${scoreColor(latestScan.scoreSchema ?? 0)};">${latestScan.scoreSchema ?? 0}</span><div style="font-size:11px;color:#6b7280;margin-top:2px;">Schema</div></div>
+        <div><span style="font-size:22px;font-weight:700;color:${scoreColor(latestScan.scoreLlm ?? 0)};">${latestScan.scoreLlm ?? 0}</span><div style="font-size:11px;color:#6b7280;margin-top:2px;">LLM</div></div>
+        <div><span style="font-size:22px;font-weight:700;color:${scoreColor(latestScan.scoreProtocol ?? 0)};">${latestScan.scoreProtocol ?? 0}</span><div style="font-size:11px;color:#6b7280;margin-top:2px;">Protocol</div></div>
+        <div><span style="font-size:22px;font-weight:700;color:${scoreColor(latestScan.scoreCompetitive ?? 0)};">${latestScan.scoreCompetitive ?? 0}</span><div style="font-size:11px;color:#6b7280;margin-top:2px;">Competitive</div></div>
+      </div>
+    </div>
+  ` : "";
 
   const content = `
-    <div class="card">
-      <h2 class="card-title">FindAble Score</h2>
-      <div class="score-ring">
-        <div class="score-number" style="color: ${scoreColor(overallScore)};">${overallScore}</div>
-        <div class="score-label">Overall AEO Score${latestScan ? "" : " — No scan yet"}</div>
-      </div>
-      <div class="dimensions">
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(schemaScore)};">${schemaScore}</div>
-          <div class="dim-label">Schema</div>
-        </div>
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(llmScore)};">${llmScore}</div>
-          <div class="dim-label">LLM Readiness</div>
-        </div>
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(protocolScore)};">${protocolScore}</div>
-          <div class="dim-label">Protocol</div>
-        </div>
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(competitiveScore)};">${competitiveScore}</div>
-          <div class="dim-label">Competitive</div>
-        </div>
-      </div>
+    <!-- Progress Tracker -->
+    <div class="card" style="padding:16px 20px;">
+      ${trackerHtml}
     </div>
 
-    <div class="card">
-      <h2 class="card-title">Product Sync</h2>
-      <div class="stat-row">
-        <span class="stat-label">Products synced</span>
-        <span class="stat-value">${productCount}</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Last scan completed</span>
-        <span class="stat-value">${escapeHtml(lastSyncTime)}</span>
-      </div>
-      <div class="actions">
-        <button class="btn btn-primary" id="sync-btn" onclick="findableSyncProducts()">Sync Products</button>
-        <button class="btn" id="scan-btn" onclick="findableScanStore()" style="background: #22c55e; color: white;">Scan Store</button>
-        <a class="btn btn-secondary" href="${escapeHtml(frontendUrl)}/dashboard" target="_top">Open Full Dashboard</a>
-      </div>
-      <div id="sync-status"></div>
-    </div>
+    ${scoreHeroHtml}
 
-    <div class="card">
-      <h2 class="card-title">Top Issues</h2>
-      ${issuesHtml}
-    </div>
-
-    <div class="card">
-      <h2 class="card-title">Store Health</h2>
-      <div class="health-grid">
-        <div class="health-card">
-          <div class="health-title">Entity Consistency</div>
-          <div class="health-value" style="color: ${entityConsistent ? "#16a34a" : "#dc2626"};">${entityConsistent ? "Consistent" : `${entityIssueCount} issue${entityIssueCount !== 1 ? "s" : ""}`}</div>
-          <div class="health-desc">${entityPrimaryBrand ? `Primary brand: ${escapeHtml(entityPrimaryBrand)}` : "No brand data found"}</div>
-        </div>
-        <div class="health-card">
-          <div class="health-title">Mismatch Alerts</div>
-          <div class="health-value" style="color: ${mismatchCount === 0 ? "#16a34a" : "#dc2626"};">${mismatchCount}</div>
-          <div class="health-desc">Products with price/availability/data mismatches</div>
-        </div>
-        <div class="health-card">
-          <div class="health-title">Products Needing Fixes</div>
-          <div class="health-value" style="color: ${needsFixCount === 0 ? "#16a34a" : "#f59e0b"};">${needsFixCount}</div>
-          <div class="health-desc">Products with AEO or Schema score below 50</div>
-        </div>
-      </div>
-      ${needsFixCount > 0 ? `
-      <div class="actions" style="margin-top: 16px;">
-        <button class="btn" id="fix-all-btn" onclick="findableFixAll()" style="background: #059669; color: white;">Fix All Products</button>
-      </div>
-      <div id="fix-all-status" class="action-status"></div>
-      ` : ""}
-    </div>
-
-    <div class="card">
-      <h2 class="card-title">LLM Visibility Test <span style="background: #ede9fe; color: #7c3aed; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; vertical-align: middle;">PRO</span></h2>
-      <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px;">Test whether AI assistants (ChatGPT, etc.) recommend your brand when shoppers ask questions about your product category.</p>
-      <div class="actions">
-        <button class="btn" id="visibility-btn" onclick="findableTestVisibility()" style="background: #7c3aed; color: white;">Test LLM Visibility</button>
-      </div>
-      <div id="visibility-status" style="display: none; margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 13px;"></div>
-      <div id="visibility-results"></div>
-    </div>
-
+    <!-- Step Cards -->
+    ${stepsHtml}
   `;
 
   return c.html(renderPage("Dashboard", content, apiKey));
