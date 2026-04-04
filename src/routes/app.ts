@@ -11,6 +11,10 @@ import {
   getShopifyAuthorizeUrl,
   validateShopifyShop,
 } from "../lib/shopify";
+import { decryptAccessToken } from "../lib/shopify-client";
+import { syncAllProducts, getProductCount, getShopInfo } from "../services/product-sync";
+import { startBulkProductSync } from "../services/bulk-operations";
+import { installScriptTag } from "../services/script-tags";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -238,7 +242,8 @@ const APP_JS = `(function() {
     status.textContent = 'Starting product sync...';
 
     try {
-      var res = await fetch('/api/shopify/store/sync', {
+      var shop = new URLSearchParams(window.location.search).get('shop') || '';
+      var res = await fetch('/app/sync?shop=' + encodeURIComponent(shop), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
@@ -274,7 +279,8 @@ const APP_JS = `(function() {
     status.textContent = 'Installing script tags...';
 
     try {
-      var res = await fetch('/api/shopify/store/script-tags', {
+      var shop = new URLSearchParams(window.location.search).get('shop') || '';
+      var res = await fetch('/app/script-tags?shop=' + encodeURIComponent(shop), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
@@ -516,6 +522,46 @@ appRoute.use("*", async (c, next) => {
   c.set("shopifyStore", store);
   c.set("shopifyShop", shopDomain);
   await next();
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /sync  — Trigger product sync                                */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/sync", async (c) => {
+  const store = c.get("shopifyStore");
+
+  if (!store.shopifyShop || !store.shopifyAccessToken) {
+    return c.json({ success: false, error: "Store is missing Shopify credentials." }, 400);
+  }
+
+  const accessToken = decryptAccessToken(store.shopifyAccessToken);
+  const shopInfo = await getShopInfo(store.shopifyShop, accessToken);
+  const count = await getProductCount(store.shopifyShop, accessToken);
+
+  if (count > 1000) {
+    const opId = await startBulkProductSync(store.shopifyShop, accessToken);
+    return c.json({ success: true, data: { mode: "bulk", operationId: opId } });
+  }
+
+  syncAllProducts(store.shopifyShop, accessToken, store.id, shopInfo.currencyCode).catch(console.error);
+  return c.json({ success: true, data: { mode: "incremental", productCount: count } });
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /script-tags  — Install script tags                          */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/script-tags", async (c) => {
+  const store = c.get("shopifyStore");
+
+  if (!store.shopifyShop || !store.shopifyAccessToken) {
+    return c.json({ success: false, error: "Store is missing Shopify credentials." }, 400);
+  }
+
+  const accessToken = decryptAccessToken(store.shopifyAccessToken);
+  await installScriptTag(store.shopifyShop, accessToken, store.id);
+  return c.json({ success: true });
 });
 
 /* ------------------------------------------------------------------ */
