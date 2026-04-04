@@ -3,8 +3,8 @@
 
 name = "FindAble"
 client_id = "" # Set from Shopify Partners dashboard
-application_url = "https://api.getfindable.au/shopify"
-embedded = false
+application_url = "https://api.getfindable.au/app"
+embedded = true
 
 [access_scopes]
 scopes = "read_products,write_script_tags,read_script_tags,read_themes,read_locales"
