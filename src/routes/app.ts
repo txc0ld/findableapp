@@ -1391,14 +1391,13 @@ appRoute.get("/", async (c) => {
   let currentStep = 1;
   if (step1Done) currentStep = 2;
   if (step1Done && step2Done) currentStep = 3;
-  if (step1Done && step2Done && totalIssues === 0) currentStep = 4;
+  if (step1Done && step2Done) currentStep = 4; // Step 4 available after scan — issues are what you fix here
   if (step1Done && step2Done && step4Progress >= productCount && productCount > 0) currentStep = 5;
   // Steps 5-7 don't auto-advance; merchant drives them
   // If step 3 has issues, stay on 3; if no issues, go to 4
   // Recalculate: step 3 is "review", step 4 is "fix"
   if (step1Done && step2Done) {
-    currentStep = 3;
-    if (totalIssues === 0 && scannedCount > 0) currentStep = 4;
+    currentStep = 4; // After scan, jump to fix step
     if (step4Progress >= productCount && productCount > 0) currentStep = 5;
   }
 
