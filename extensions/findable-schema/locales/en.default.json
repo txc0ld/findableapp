@@ -1,0 +1,8 @@
+{
+  "name": "FindAble Schema",
+  "blocks": {
+    "schema-injection": {
+      "name": "FindAble JSON-LD"
+    }
+  }
+}

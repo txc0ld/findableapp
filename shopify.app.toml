@@ -1,43 +1,44 @@
-# FindAble Shopify App Configuration
-# https://shopify.dev/docs/apps/tools/cli/configuration
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-name = "FindAble"
 client_id = "c010253ca5cf76889ab73e474f0d686e"
+name = "FindAble"
 application_url = "https://api.getfindable.au/app"
 embedded = true
 
-[access_scopes]
-scopes = "read_products,write_script_tags,read_script_tags,read_themes,read_locales"
-
-[auth]
-redirect_urls = [
-  "https://api.getfindable.au/shopify/callback",
-  "http://localhost:3001/shopify/callback"
-]
-
 [webhooks]
-api_version = "2026-01"
+api_version = "2026-04"
 
   [webhooks.privacy_compliance]
-  customer_data_request_url = "https://api.getfindable.au/shopify/webhooks"
   customer_deletion_url = "https://api.getfindable.au/shopify/webhooks"
+  customer_data_request_url = "https://api.getfindable.au/shopify/webhooks"
   shop_deletion_url = "https://api.getfindable.au/shopify/webhooks"
 
-[[webhooks.subscriptions]]
-topics = [
-  "products/create",
-  "products/update",
-  "products/delete",
+  [[webhooks.subscriptions]]
+  topics = [
   "app/uninstalled",
-  "bulk_operations/finish"
+  "bulk_operations/finish",
+  "products/create",
+  "products/delete",
+  "products/update"
 ]
-uri = "https://api.getfindable.au/shopify/webhooks"
+  uri = "https://api.getfindable.au/shopify/webhooks"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_locales,read_products,read_script_tags,write_script_tags,read_themes"
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [ "https://api.getfindable.au/shopify/callback" ]
 
 [app_proxy]
 url = "https://api.getfindable.au/proxy/findable"
 subpath = "findable"
 prefix = "apps"
-# Accessible at: https://your-store.myshopify.com/apps/findable/*
 
 [pos]
 embedded = false
+
+[build]
+automatically_update_urls_on_dev = true
