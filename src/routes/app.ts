@@ -154,9 +154,9 @@ function redirectPage(url: string): string {
 </head>
 <body data-redirect="${escapeHtml(url)}">
   <div class="loading">
-    <div class="spinner"></div>
-    <p>Redirecting to Shopify...</p>
-    <p><a href="${escapeHtml(url)}">Click here if not redirected</a></p>
+    <p style="font-size: 18px; font-weight: 600; color: #1a1a1a; margin: 0 0 8px;">FindAble</p>
+    <p>To continue, connect your Shopify store.</p>
+    <a href="${escapeHtml(url)}" target="_top" style="display: inline-block; margin-top: 16px; padding: 12px 24px; background: #4f46e5; color: white; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px;">Connect to Shopify</a>
   </div>
   <script src="/app/assets/app.js"></script>
 </body>
@@ -302,10 +302,10 @@ const APP_JS = `(function() {
 
   /* ---- Init ---- */
 
-  // Top-level redirect (breaks out of iframe if embedded)
+  // Auto-redirect when NOT in an iframe (non-embedded mode)
   var redirectUrl = document.body.dataset.redirect;
-  if (redirectUrl) {
-    try { window.top.location.href = redirectUrl; } catch(e) { window.location.href = redirectUrl; }
+  if (redirectUrl && window.top === window.self) {
+    window.location.href = redirectUrl;
   }
 
   if (document.body.dataset.needsSetup === 'true') {
