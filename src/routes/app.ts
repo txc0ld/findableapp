@@ -167,25 +167,26 @@ const APP_JS = `(function() {
   async function runSetup() {
     try {
       updateStatus('Authenticating...');
-      console.log('[FindAble] Starting setup via /app/api/init');
 
-      // App Bridge automatically adds Authorization: Bearer <session_token>
-      var res = await fetch('/app/api/init', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
+      // Get session token from App Bridge
+      var token = await shopify.idToken();
+      console.log('[FindAble] Got session token, length:', token ? token.length : 0);
 
-      console.log('[FindAble] Init response:', res.status);
-
-      if (res.ok) {
-        var data = await res.json().catch(function() { return {}; });
-        updateStatus('Ready! Loading dashboard...');
-        var shop = data.shop || new URLSearchParams(window.location.search).get('shop') || '';
-        window.location.href = '/app?shop=' + encodeURIComponent(shop);
-      } else {
-        var err = await res.json().catch(function() { return {}; });
-        showError(err.error || 'Setup failed (' + res.status + '). Please refresh.');
+      if (!token) {
+        showError('Could not get session token. Please refresh.');
+        return;
       }
+
+      updateStatus('Setting up your store...');
+
+      // Navigate to setup endpoint — page navigation bypasses App Bridge
+      // fetch interception which proxies through admin.shopify.com
+      var params = new URLSearchParams(window.location.search);
+      var shop = params.get('shop') || '';
+      var host = params.get('host') || '';
+      window.location.href = '/app/api/init?token=' + encodeURIComponent(token)
+        + '&shop=' + encodeURIComponent(shop)
+        + '&host=' + encodeURIComponent(host);
     } catch(e) {
       showError('Error: ' + e.message);
     }
@@ -289,25 +290,23 @@ appRoute.get("/assets/app.js", (c) => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  POST /api/init — server-side token exchange                       */
+/*  GET /api/init — server-side token exchange                        */
 /*                                                                    */
-/*  Called by the setup page JS. App Bridge adds the Authorization    */
-/*  header automatically so we get the session token from there.      */
+/*  Called via page navigation (not fetch) to bypass App Bridge's     */
+/*  fetch proxy. The session token arrives as a query parameter.      */
+/*  On success, redirects to /app?shop=…                              */
 /* ------------------------------------------------------------------ */
 
-appRoute.post("/api/init", async (c) => {
+appRoute.get("/api/init", async (c) => {
   if (!db || !env.SHOPIFY_API_KEY || !env.SHOPIFY_API_SECRET) {
-    return c.json({ error: "Server not configured" }, 503);
+    return c.text("Server not configured", 503);
   }
 
-  // Get session token from Authorization header (added by App Bridge)
-  const authorization = c.req.header("authorization");
-  const sessionToken = authorization?.startsWith("Bearer ")
-    ? authorization.slice(7).trim()
-    : null;
+  const sessionToken = c.req.query("token");
+  const hostParam = c.req.query("host") ?? "";
 
   if (!sessionToken) {
-    return c.json({ error: "No session token. Please reload the page." }, 401);
+    return c.text("Missing session token. Please go back and try again.", 400);
   }
 
   // Verify the session token
@@ -318,7 +317,7 @@ appRoute.post("/api/init", async (c) => {
     console.log(`[app/api/init] Token verified for: ${shopDomain}`);
   } catch (err) {
     console.error("[app/api/init] Token verification failed:", err);
-    return c.json({ error: "Invalid session token" }, 401);
+    return c.text("Invalid session token. Please go back and try again.", 401);
   }
 
   // Check if store already exists
@@ -327,7 +326,7 @@ appRoute.post("/api/init", async (c) => {
   });
   if (existing) {
     console.log(`[app/api/init] Store already exists: ${existing.id}`);
-    return c.json({ success: true, storeId: existing.id, shop: shopDomain });
+    return c.redirect(`/app?shop=${encodeURIComponent(shopDomain)}&host=${encodeURIComponent(hostParam)}`, 302);
   }
 
   // Exchange session token for offline access token
@@ -351,7 +350,7 @@ appRoute.post("/api/init", async (c) => {
   if (!tokenExchangeResponse.ok) {
     const errText = await tokenExchangeResponse.text();
     console.error(`[app/api/init] Token exchange failed: ${tokenExchangeResponse.status} ${errText}`);
-    return c.json({ error: "Token exchange failed" }, 502);
+    return c.text("Token exchange failed. Please go back and try again.", 502);
   }
 
   const tokenData = (await tokenExchangeResponse.json()) as {
@@ -401,7 +400,8 @@ appRoute.post("/api/init", async (c) => {
   const store = inserted[0];
   console.log(`[app/api/init] Store created: ${store?.id} for ${shopDomain}`);
 
-  return c.json({ success: true, storeId: store?.id, shop: shopDomain });
+  // Redirect to the app dashboard
+  return c.redirect(`/app?shop=${encodeURIComponent(shopDomain)}&host=${encodeURIComponent(hostParam)}`, 302);
 });
 
 /* ------------------------------------------------------------------ */
