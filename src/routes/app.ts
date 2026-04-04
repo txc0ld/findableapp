@@ -566,17 +566,38 @@ const APP_JS = `(function() {
     status.style.display = 'block';
     status.style.background = '#eff6ff';
     status.style.color = '#2563eb';
-    status.textContent = 'Running LLM visibility tests (this may take 15-30 seconds)...';
+    status.textContent = 'Starting LLM visibility tests...';
     if (resultsDiv) resultsDiv.innerHTML = '';
 
     try {
-      var res = await fetch('/app/visibility-test', {
+      // Start the test (returns immediately)
+      var startRes = await fetch('/app/visibility-test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
-      var data = await res.json();
-      if (res.ok && data.success) {
-        var report = data.data;
+      if (!startRes.ok) {
+        var errData = await startRes.json().catch(function() { return {}; });
+        throw new Error(errData.error || 'Failed to start test');
+      }
+
+      // Poll for results
+      status.textContent = 'Running LLM visibility tests (3 prompts)...';
+      var report = null;
+      for (var attempt = 0; attempt < 30; attempt++) {
+        await new Promise(function(r) { setTimeout(r, 2000); });
+        var pollRes = await fetch('/app/visibility-status');
+        var pollData = await pollRes.json();
+        if (pollData.status === 'complete') {
+          report = pollData.data;
+          break;
+        } else if (pollData.status === 'error') {
+          throw new Error(pollData.error || 'Test failed');
+        }
+        status.textContent = 'Running LLM visibility tests... (' + (attempt + 1) * 2 + 's)';
+      }
+      if (!report) throw new Error('Test timed out');
+
+      if (true) {
         var pct = Math.round(report.mentionRate * 100);
         var color = pct >= 50 ? '#16a34a' : pct >= 20 ? '#d97706' : '#dc2626';
         status.style.background = '#f0fdf4';
@@ -1119,6 +1140,9 @@ appRoute.post("/script-tags", async (c) => {
 /*  POST /visibility-test  — LLM visibility testing (Pro tier)        */
 /* ------------------------------------------------------------------ */
 
+// In-memory store for visibility test results (keyed by storeId)
+const visibilityResults = new Map<string, { status: string; data?: unknown; error?: string }>();
+
 appRoute.post("/visibility-test", async (c) => {
   const store = c.get("shopifyStore");
 
@@ -1130,75 +1154,54 @@ appRoute.post("/visibility-test", async (c) => {
     return c.json({ success: false, error: "OpenAI API key not configured." }, 503);
   }
 
-  // Get brand name from store name (fallback to shop domain)
-  let brandName = store.name ?? store.shopifyShop?.replace(".myshopify.com", "") ?? "Unknown";
+  // Return immediately, process in background
+  visibilityResults.set(store.id, { status: "running" });
 
-  // Try to get vendor from the first product's extractedAttributes
-  const firstProduct = await db
-    .select({
-      name: products.name,
-      extractedAttributes: products.extractedAttributes,
-      googleCategory: products.googleCategory,
-    })
-    .from(products)
-    .where(eq(products.storeId, store.id))
-    .limit(5);
+  // Fire and forget
+  (async () => {
+    try {
+      let brandName = store.name ?? store.shopifyShop?.replace(".myshopify.com", "") ?? "Unknown";
 
-  if (firstProduct.length === 0) {
-    return c.json({
-      success: false,
-      error: "No products synced yet. Sync your products first.",
-    }, 400);
-  }
+      const firstProduct = await db!
+        .select({ extractedAttributes: products.extractedAttributes, googleCategory: products.googleCategory })
+        .from(products)
+        .where(eq(products.storeId, store.id))
+        .limit(5);
 
-  // Use the vendor from the first product if available
-  const firstAttrs = firstProduct[0]?.extractedAttributes as Record<string, unknown> | null;
-  if (firstAttrs?.vendor && typeof firstAttrs.vendor === "string" && firstAttrs.vendor.length > 0) {
-    brandName = firstAttrs.vendor;
-  }
+      const firstAttrs = firstProduct[0]?.extractedAttributes as Record<string, unknown> | null;
+      if (firstAttrs?.vendor && typeof firstAttrs.vendor === "string" && firstAttrs.vendor.length > 0) {
+        brandName = firstAttrs.vendor;
+      }
 
-  // Determine product categories from extractedAttributes
-  const categorySet = new Set<string>();
-  for (const p of firstProduct) {
-    const attrs = p.extractedAttributes as Record<string, unknown> | null;
-    if (attrs?.productType && typeof attrs.productType === "string" && attrs.productType.length > 0) {
-      categorySet.add(attrs.productType);
+      const categorySet = new Set<string>();
+      for (const p of firstProduct) {
+        const attrs = p.extractedAttributes as Record<string, unknown> | null;
+        if (attrs?.productType && typeof attrs.productType === "string") categorySet.add(attrs.productType);
+        if (p.googleCategory) categorySet.add(p.googleCategory);
+      }
+      const productCategory = categorySet.size > 0 ? Array.from(categorySet)[0]! : "products";
+
+      const report = await testLlmVisibility({
+        brandName,
+        productCategory,
+        useCases: ["everyday use", "beginners", "professionals"],
+      });
+
+      visibilityResults.set(store.id, { status: "complete", data: report });
+    } catch (err) {
+      console.error("[app] Visibility test error:", err);
+      visibilityResults.set(store.id, { status: "error", error: err instanceof Error ? err.message : "Failed" });
     }
-    if (p.googleCategory) {
-      categorySet.add(p.googleCategory);
-    }
-  }
+  })();
 
-  // Fallback to a generic category from product names
-  const productCategory = categorySet.size > 0
-    ? Array.from(categorySet)[0]!
-    : "products";
+  return c.json({ success: true, status: "running" });
+});
 
-  // Build 3-5 use cases for testing
-  const defaultUseCases = [
-    "everyday use",
-    "beginners",
-    "professionals",
-    "value for money",
-    "sustainability",
-  ];
-  const useCases = defaultUseCases.slice(0, Math.min(5, Math.max(3, defaultUseCases.length)));
-
-  try {
-    const report = await testLlmVisibility({
-      brandName,
-      productCategory,
-      useCases,
-    });
-
-    return c.json({ success: true, data: report });
-  } catch (err) {
-    console.error("[app] Visibility test error:", err);
-    return c.json({
-      success: false,
-      error: err instanceof Error ? err.message : "Visibility test failed.",
-    }, 500);
-  }
+appRoute.get("/visibility-status", async (c) => {
+  const store = c.get("shopifyStore");
+  const result = visibilityResults.get(store.id);
+  if (!result) return c.json({ status: "none" });
+  return c.json(result);
 });
 
 /* ------------------------------------------------------------------ */
