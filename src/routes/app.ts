@@ -133,6 +133,36 @@ function setupPage(apiKey: string): string {
 </html>`;
 }
 
+/**
+ * Redirect page — serves an HTML page that redirects via external JS.
+ * Uses window.top.location.href to break out of iframes.
+ */
+function redirectPage(url: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FindAble — Redirecting</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #f6f6f7; }
+    .loading { text-align: center; color: #6b7280; }
+    .spinner { width: 32px; height: 32px; border: 3px solid #e5e7eb; border-top-color: #4f46e5; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    a { color: #4f46e5; }
+  </style>
+</head>
+<body data-redirect="${escapeHtml(url)}">
+  <div class="loading">
+    <div class="spinner"></div>
+    <p>Redirecting to Shopify...</p>
+    <p><a href="${escapeHtml(url)}">Click here if not redirected</a></p>
+  </div>
+  <script src="/app/assets/app.js"></script>
+</body>
+</html>`;
+}
+
 const appRoute = new Hono<{ Variables: ShopifySessionVariables }>();
 
 // Allow Shopify admin to iframe this app — must run on ALL responses
@@ -271,6 +301,12 @@ const APP_JS = `(function() {
   };
 
   /* ---- Init ---- */
+
+  // Top-level redirect (breaks out of iframe if embedded)
+  var redirectUrl = document.body.dataset.redirect;
+  if (redirectUrl) {
+    try { window.top.location.href = redirectUrl; } catch(e) { window.location.href = redirectUrl; }
+  }
 
   if (document.body.dataset.needsSetup === 'true') {
     // Wait for App Bridge to patch fetch with session token injection
@@ -474,7 +510,8 @@ appRoute.use("*", async (c, next) => {
       shop: shopDomain,
       returnUrl: "/app",
     });
-    return c.redirect(getShopifyAuthorizeUrl(shopDomain, state), 302);
+    // Serve HTML page that redirects via JS (breaks out of iframe if embedded)
+    return c.html(redirectPage(getShopifyAuthorizeUrl(shopDomain, state)), 200);
   }
 
   console.log(`[app] Authenticated: store=${store.id}, shop=${shopDomain}`);
