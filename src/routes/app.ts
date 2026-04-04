@@ -824,12 +824,14 @@ appRoute.post("/scan", async (c) => {
     return c.json({ success: false, error: "Failed to create scan record." }, 500);
   }
 
-  // Enqueue the scan job
-  await enqueueScanJob({
+  // Process scan directly for small stores (< 50 products)
+  // to avoid Redis/BullMQ reliability issues
+  const { processScanJob } = await import("../workers/scan-worker");
+  processScanJob({
     scanId: scanRecord.id,
     urls,
     email,
-  });
+  }).catch((err) => console.error("[app/scan] Scan failed:", err));
 
   return c.json({
     success: true,
