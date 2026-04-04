@@ -161,9 +161,21 @@ function appBridgeBootstrap(apiKey: string, shop: string): string {
     async function doSetup() {
       try {
         updateStatus('Authenticating...');
-        console.log('[FindAble] Getting session token...');
-        var token = await shopify.idToken();
-        console.log('[FindAble] Got token, length:', token ? token.length : 0);
+
+        // First try: get id_token from URL query params (Shopify sends this on managed install)
+        var params = new URLSearchParams(window.location.search);
+        var token = params.get('id_token');
+        console.log('[FindAble] id_token from URL:', token ? 'present (' + token.length + ' chars)' : 'absent');
+
+        // Fallback: get session token from App Bridge
+        if (!token) {
+          console.log('[FindAble] Getting session token from App Bridge...');
+          token = await Promise.race([
+            shopify.idToken(),
+            new Promise(function(_, reject) { setTimeout(function() { reject(new Error('Token timeout')); }, 5000); })
+          ]);
+          console.log('[FindAble] Got App Bridge token, length:', token ? token.length : 0);
+        }
 
         updateStatus('Creating your account...');
         var res = await fetch('/app/auth/setup', {
