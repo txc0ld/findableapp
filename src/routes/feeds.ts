@@ -13,11 +13,27 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 
 import { db } from "../db/client";
-import { stores } from "../db/schema";
+import { issues, products, scans, stores } from "../db/schema";
 import { generateAcpFeed, generateGmcSupplementalFeed } from "../services/feed-generator";
 import type { StoreConfig } from "../services/schema-generator";
 
 export const feedsRoute = new Hono();
+
+// One-time cleanup — DELETE after use
+feedsRoute.get("/cleanup/:shop", async (c) => {
+  if (!db) return c.text("No DB", 503);
+  const shop = c.req.param("shop");
+  const store = await db.query.stores.findFirst({ where: eq(stores.shopifyShop, shop) });
+  if (!store) return c.text("Store not found", 404);
+
+  const allProducts = await db.select({ id: products.id }).from(products).where(eq(products.storeId, store.id));
+  for (const p of allProducts) {
+    await db.delete(issues).where(eq(issues.productId, p.id));
+  }
+  await db.delete(products).where(eq(products.storeId, store.id));
+  await db.delete(scans).where(eq(scans.storeId, store.id));
+  return c.json({ success: true, deleted: allProducts.length });
+});
 
 /* ------------------------------------------------------------------ */
 /*  Helper: look up store by shopify domain                           */
