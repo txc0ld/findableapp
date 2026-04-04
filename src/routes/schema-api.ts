@@ -116,7 +116,13 @@ schemaApiRoute.get("/product", async (c) => {
     | null
     | undefined;
 
-  const schemas = generateAllSchemas(mapped, storeConfig, faqs ?? undefined);
+  const schemas = generateAllSchemas(
+    mapped,
+    storeConfig,
+    faqs ?? undefined,
+    product.hasReviewSchema,
+    product.existingSchema,
+  );
 
   const validation = validateAllSchemas(schemas, {
     price: mapped.price ?? undefined,

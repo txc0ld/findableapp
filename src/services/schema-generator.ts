@@ -189,6 +189,7 @@ function buildOffer(
 ): Record<string, unknown> {
   const offer: Record<string, unknown> = {
     "@type": "Offer",
+    "@id": `${product.url}#offer`,
     price: variant.price.toFixed(2),
     priceCurrency: variant.currency || config.currency,
     availability: variant.available
@@ -198,6 +199,7 @@ function buildOffer(
     priceValidUntil: priceValidUntil(),
     seller: {
       "@type": "Organization",
+      "@id": `https://${config.storeUrl.replace(/^https?:\/\//, "")}#organization`,
       name: config.storeName,
     },
     url: product.url,
@@ -276,7 +278,11 @@ function buildAggregateRating(
 }
 
 /** Generate a single Product schema */
-function buildSingleProductSchema(product: MappedProduct, config: StoreConfig): Record<string, unknown> {
+function buildSingleProductSchema(
+  product: MappedProduct,
+  config: StoreConfig,
+  skipAggregateRating = false,
+): Record<string, unknown> {
   const variant = product.variants[0];
   if (!variant) {
     throw new Error(`Product ${product.platformProductId} has no variants.`);
@@ -286,10 +292,13 @@ function buildSingleProductSchema(product: MappedProduct, config: StoreConfig): 
   const schema: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "Product",
+    "@id": `${product.url}#product`,
     name: product.name,
     url: product.url,
     image: product.images.length > 0 ? product.images.map((i) => i.url) : undefined,
-    brand: product.vendor ? { "@type": "Brand", name: product.vendor } : undefined,
+    brand: product.vendor
+      ? { "@type": "Brand", "@id": `${product.url}#brand`, name: product.vendor }
+      : undefined,
     offers: buildOffer(product, variant, config),
   };
 
@@ -323,15 +332,21 @@ function buildSingleProductSchema(product: MappedProduct, config: StoreConfig): 
   const additionalProps = buildAdditionalProperties(product);
   if (additionalProps.length > 0) schema.additionalProperty = additionalProps;
 
-  // AggregateRating — scored at +3 points
-  const rating = buildAggregateRating(product);
-  if (rating) schema.aggregateRating = rating;
+  // AggregateRating — scored at +3 points (skip if a review app already owns this)
+  if (!skipAggregateRating) {
+    const rating = buildAggregateRating(product);
+    if (rating) schema.aggregateRating = rating;
+  }
 
   return schema;
 }
 
 /** Generate ProductGroup + hasVariant schema */
-function buildProductGroupSchema(product: MappedProduct, config: StoreConfig): Record<string, unknown> {
+function buildProductGroupSchema(
+  product: MappedProduct,
+  config: StoreConfig,
+  skipAggregateRating = false,
+): Record<string, unknown> {
   const description = sanitizeDescription(product.description);
 
   // Determine what varies between variants
@@ -347,10 +362,13 @@ function buildProductGroupSchema(product: MappedProduct, config: StoreConfig): R
   const schema: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "ProductGroup",
+    "@id": `${product.url}#product`,
     name: product.name,
     url: product.url,
     image: product.images.length > 0 ? product.images.map((i) => i.url) : undefined,
-    brand: product.vendor ? { "@type": "Brand", name: product.vendor } : undefined,
+    brand: product.vendor
+      ? { "@type": "Brand", "@id": `${product.url}#brand`, name: product.vendor }
+      : undefined,
     productGroupID: product.platformProductId,
     variesBy: Array.from(varyingOptions).map(
       (opt) => `https://schema.org/${opt.toLowerCase()}`,
@@ -369,8 +387,11 @@ function buildProductGroupSchema(product: MappedProduct, config: StoreConfig): R
   const additionalProps = buildAdditionalProperties(product);
   if (additionalProps.length > 0) schema.additionalProperty = additionalProps;
 
-  const rating = buildAggregateRating(product);
-  if (rating) schema.aggregateRating = rating;
+  // AggregateRating (skip if a review app already owns this)
+  if (!skipAggregateRating) {
+    const rating = buildAggregateRating(product);
+    if (rating) schema.aggregateRating = rating;
+  }
 
   schema.hasVariant = product.variants.map((variant) => {
     const variantSchema: Record<string, unknown> = {
@@ -408,15 +429,19 @@ function buildProductGroupSchema(product: MappedProduct, config: StoreConfig): R
  * Generate complete Product or ProductGroup JSON-LD.
  * Automatically uses ProductGroup when there are meaningful variants.
  */
-export function generateProductSchema(product: MappedProduct, config: StoreConfig): Record<string, unknown> {
+export function generateProductSchema(
+  product: MappedProduct,
+  config: StoreConfig,
+  skipAggregateRating = false,
+): Record<string, unknown> {
   const hasMeaningfulVariants = product.variants.length > 1
     && product.variants.some((v) =>
       v.options.some((o) => o.name.toLowerCase() !== "title" && o.value.toLowerCase() !== "default title"),
     );
 
   return hasMeaningfulVariants
-    ? buildProductGroupSchema(product, config)
-    : buildSingleProductSchema(product, config);
+    ? buildProductGroupSchema(product, config, skipAggregateRating)
+    : buildSingleProductSchema(product, config, skipAggregateRating);
 }
 
 /**
@@ -477,6 +502,7 @@ export function generateOrganizationSchema(config: StoreConfig): Record<string, 
   const org: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "Organization",
+    "@id": `https://${config.storeUrl.replace(/^https?:\/\//, "")}#organization`,
     name: config.storeName,
     url: config.storeUrl,
   };
@@ -486,17 +512,53 @@ export function generateOrganizationSchema(config: StoreConfig): Record<string, 
   return org;
 }
 
+/** Known review app markers in existingSchema that indicate third-party AggregateRating ownership */
+const REVIEW_APP_MARKERS = [
+  "judge.me",
+  "judgeme",
+  "stamped.io",
+  "stamped",
+  "loox.io",
+  "loox",
+  "yotpo",
+  "okendo",
+  "rivyo",
+  "ali reviews",
+  "shopify-product-reviews",
+];
+
+/**
+ * Detect whether existingSchema contains AggregateRating from a known review app.
+ * Checks for app identifiers in the JSON blob's string representation.
+ */
+function existingSchemaHasReviewApp(existingSchema: Record<string, unknown> | null | undefined): boolean {
+  if (!existingSchema) return false;
+  const blob = JSON.stringify(existingSchema).toLowerCase();
+  if (!blob.includes("aggregaterating")) return false;
+  return REVIEW_APP_MARKERS.some((marker) => blob.includes(marker));
+}
+
 /**
  * Generate all schema blocks for a product page.
  * Returns an array of JSON-LD objects to wrap in <script type="application/ld+json">.
+ *
+ * @param hasReviewSchema - If true (from DB), the page already has review markup
+ *   from a third-party app, so we skip emitting our own AggregateRating.
+ * @param existingSchema - Raw JSON-LD found on the page during scanning; checked
+ *   for known review app signatures as a secondary signal.
  */
 export function generateAllSchemas(
   product: MappedProduct,
   config: StoreConfig,
   faqs?: Array<{ question: string; answer: string }>,
+  hasReviewSchema?: boolean,
+  existingSchema?: Record<string, unknown> | null,
 ): Record<string, unknown>[] {
+  // Skip our AggregateRating if a review app already owns it
+  const skipAggregateRating = !!hasReviewSchema || existingSchemaHasReviewApp(existingSchema);
+
   const schemas: Record<string, unknown>[] = [
-    generateProductSchema(product, config),
+    generateProductSchema(product, config, skipAggregateRating),
     generateBreadcrumbSchema(product, config),
   ];
 
