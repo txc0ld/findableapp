@@ -1,6 +1,6 @@
 import { Worker } from "bullmq";
 import IORedis from "ioredis";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 
 import { db } from "../db/client";
 import { env } from "../lib/env";
@@ -47,43 +47,60 @@ export async function processScanJob(payload: ScanJobPayload) {
       .where(eq(scans.id, payload.scanId));
 
     if (scanRecord) {
+      // Delete old issues for this scan
       await db.delete(issues).where(eq(issues.scanId, payload.scanId));
-      await db.delete(products).where(eq(products.scanId, payload.scanId));
 
-      const insertedProducts = await db
-        .insert(products)
-        .values(
-          result.products.map((product) => ({
-            scanId: payload.scanId,
+      // Update existing products by URL (from sync) instead of creating duplicates.
+      // Only create new product records if no synced product exists for that URL.
+      const productIdByUrl = new Map<string, string>();
+
+      for (const product of result.products) {
+        const scanData = {
+          scanId: payload.scanId,
+          googleCategory: product.category,
+          hasJsonld: product.schemaScore >= 35,
+          hasGtin: product.issues.every((issue) => !issue.title.includes("identifier")),
+          hasBrand: product.issues.every((issue) => !issue.title.includes("brand")),
+          hasShippingSchema: product.issues.every((issue) => !issue.title.includes("Shipping")),
+          hasReturnSchema: product.issues.every((issue) => !issue.title.includes("Return")),
+          hasReviewSchema: product.issues.every((issue) => !issue.title.includes("Review")),
+          hasFaqSchema: product.issues.every((issue) => !issue.title.includes("FAQ")),
+          schemaScore: product.schemaScore,
+          aeoScore: product.llmScore,
+          llmScore: product.llmScore,
+          generatedSchema: product.generatedSchema,
+          missingAttributes: product.issues.map((issue) => issue.title),
+        };
+
+        // Try to find an existing product for this store + URL
+        const existing = await db.query.products.findFirst({
+          where: and(
+            eq(products.storeId, scanRecord.storeId!),
+            eq(products.url, product.url),
+          ),
+        });
+
+        if (existing) {
+          // Update existing product with scan results — preserve synced data
+          await db.update(products).set(scanData).where(eq(products.id, existing.id));
+          productIdByUrl.set(product.url, existing.id);
+        } else {
+          // No synced product for this URL — create a new record
+          const [inserted] = await db.insert(products).values({
+            ...scanData,
             storeId: scanRecord.storeId,
             url: product.url,
             name: product.name,
-            googleCategory: product.category,
             price: product.price?.toFixed(2),
             currency: product.price !== null ? "USD" : null,
-            hasJsonld: product.schemaScore >= 35,
-            hasGtin: product.issues.every((issue) => !issue.title.includes("identifier")),
-            hasBrand: product.issues.every((issue) => !issue.title.includes("brand")),
-            hasShippingSchema: product.issues.every((issue) => !issue.title.includes("Shipping")),
-            hasReturnSchema: product.issues.every((issue) => !issue.title.includes("Return")),
-            hasReviewSchema: product.issues.every((issue) => !issue.title.includes("Review")),
-            hasFaqSchema: product.issues.every((issue) => !issue.title.includes("FAQ")),
-            schemaScore: product.schemaScore,
-            aeoScore: product.llmScore,
-            llmScore: product.llmScore,
-            generatedSchema: product.generatedSchema,
-            missingAttributes: product.issues.map((issue) => issue.title),
-          })),
-        )
-        .returning({
-          id: products.id,
-          name: products.name,
-          url: products.url,
-        });
+          }).returning({ id: products.id });
+          if (inserted) {
+            productIdByUrl.set(product.url, inserted.id);
+          }
+        }
+      }
 
-      const productIdByUrl = new Map(
-        insertedProducts.map((product) => [product.url, product.id]),
-      );
+      // Insert issues linked to products
       const issuesToInsert = result.issues.map((issue) => {
         const matchingProduct = result.products.find(
           (product) => product.name === issue.productName,
