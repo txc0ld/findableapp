@@ -5,7 +5,12 @@ import { db } from "../db/client";
 import { accounts, stores, products, issues, scans } from "../db/schema";
 import type { ShopifySessionVariables } from "../lib/shopify-session";
 import { verifyShopifySessionToken } from "../lib/shopify-session";
-import { encryptShopifyAccessToken } from "../lib/shopify";
+import {
+  createShopifyOAuthState,
+  encryptShopifyAccessToken,
+  getShopifyAuthorizeUrl,
+  validateShopifyShop,
+} from "../lib/shopify";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -407,10 +412,9 @@ appRoute.get("/api/init", async (c) => {
 /* ------------------------------------------------------------------ */
 /*  Auth middleware for HTML pages                                    */
 /*                                                                    */
-/*  Skips /assets/ and /api/ routes (those have their own auth).      */
-/*  Checks Authorization header, id_token query param, then shop      */
-/*  query param. If a store exists, continue; otherwise serve the     */
-/*  setup page which triggers /api/init via App Bridge.               */
+/*  Non-embedded mode: the app opens in its own tab (no iframe).      */
+/*  Checks id_token query param, then shop query param.               */
+/*  If no store exists, redirects to the standard OAuth install flow. */
 /* ------------------------------------------------------------------ */
 
 appRoute.use("*", async (c, next) => {
@@ -422,41 +426,24 @@ appRoute.use("*", async (c, next) => {
   }
 
   if (!db) {
-    return c.html(setupPage(env.SHOPIFY_API_KEY ?? ""), 200);
+    return c.text("Database not configured", 503);
   }
 
   let shopDomain: string | null = null;
 
-  // 1. Check Authorization header (App Bridge adds this to fetch calls)
-  const authorization = c.req.header("authorization");
-  const bearerToken = authorization?.startsWith("Bearer ")
-    ? authorization.slice(7).trim()
-    : null;
-  if (bearerToken) {
+  // 1. Check id_token query param (Shopify managed install)
+  const idToken = c.req.query("id_token");
+  if (idToken) {
     try {
-      const result = await verifyShopifySessionToken(bearerToken);
+      const result = await verifyShopifySessionToken(idToken);
       shopDomain = result.shop;
-      console.log(`[app] Auth header verified for shop: ${shopDomain}`);
+      console.log(`[app] id_token verified for shop: ${shopDomain}`);
     } catch {
       // Token invalid — continue to next check
     }
   }
 
-  // 2. Check id_token query param (Shopify managed install)
-  if (!shopDomain) {
-    const idToken = c.req.query("id_token");
-    if (idToken) {
-      try {
-        const result = await verifyShopifySessionToken(idToken);
-        shopDomain = result.shop;
-        console.log(`[app] id_token verified for shop: ${shopDomain}`);
-      } catch {
-        // Token invalid — continue to next check
-      }
-    }
-  }
-
-  // 3. Fallback: shop query param (basic lookup, no signature check)
+  // 2. Fallback: shop query param
   if (!shopDomain) {
     const shopParam = c.req.query("shop");
     if (shopParam) {
@@ -466,8 +453,8 @@ appRoute.use("*", async (c, next) => {
   }
 
   if (!shopDomain) {
-    console.log("[app] No shop domain — serving setup page");
-    return c.html(setupPage(env.SHOPIFY_API_KEY ?? ""), 200);
+    console.log("[app] No shop domain");
+    return c.text("Missing shop parameter. Please open this app from Shopify admin.", 400);
   }
 
   // Look up existing store
@@ -476,8 +463,18 @@ appRoute.use("*", async (c, next) => {
   });
 
   if (!store) {
-    console.log(`[app] No store for ${shopDomain} — serving setup page`);
-    return c.html(setupPage(env.SHOPIFY_API_KEY ?? ""), 200);
+    // No store yet — redirect to OAuth install flow
+    console.log(`[app] No store for ${shopDomain} — redirecting to OAuth`);
+
+    if (!validateShopifyShop(shopDomain)) {
+      return c.text("Invalid shop domain.", 400);
+    }
+
+    const state = await createShopifyOAuthState({
+      shop: shopDomain,
+      returnUrl: "/app",
+    });
+    return c.redirect(getShopifyAuthorizeUrl(shopDomain, state), 302);
   }
 
   console.log(`[app] Authenticated: store=${store.id}, shop=${shopDomain}`);

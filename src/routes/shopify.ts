@@ -248,6 +248,13 @@ shopifyRoute.get("/callback", async (c) => {
     installScriptTag(parseResult.data.shop, tokenResponse.access_token, storeId).catch(console.error);
   }
 
+  // If the install was started from the Shopify admin app, redirect back there
+  if (state.returnUrl) {
+    const appUrl = new URL(state.returnUrl, env.SHOPIFY_APP_URL);
+    appUrl.searchParams.set("shop", parseResult.data.shop);
+    return c.redirect(appUrl.toString(), 302);
+  }
+
   const redirectUrl = new URL("/dashboard/settings", env.FRONTEND_URL);
   redirectUrl.searchParams.set("shopify", "connected");
   redirectUrl.searchParams.set("shop", parseResult.data.shop);

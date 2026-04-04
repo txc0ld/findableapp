@@ -16,6 +16,7 @@ const SHOPIFY_SCOPES = [
 
 interface ShopifyOAuthState {
   accountId?: string;
+  returnUrl?: string;
   shop: string;
 }
 

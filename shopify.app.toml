@@ -3,7 +3,7 @@
 client_id = "c010253ca5cf76889ab73e474f0d686e"
 name = "FindAble"
 application_url = "https://api.getfindable.au/app"
-embedded = true
+embedded = false
 
 [build]
 automatically_update_urls_on_dev = true
