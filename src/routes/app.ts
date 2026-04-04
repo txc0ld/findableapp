@@ -10,7 +10,6 @@ import { decryptAccessToken } from "../lib/shopify-client";
 import { syncAllProducts, getProductCount, getShopInfo } from "../services/product-sync";
 import { startBulkProductSync } from "../services/bulk-operations";
 import { installScriptTag } from "../services/script-tags";
-import { enqueueScanJob } from "../lib/queue";
 import { testLlmVisibility } from "../services/llm-tester";
 import { analyzeWithAi } from "../services/ai-analyzer";
 import type { AiAnalysisInput } from "../services/ai-analyzer";
@@ -342,6 +341,7 @@ const APP_JS = `(function() {
     btn.textContent = 'Scanning...';
     status.className = 'loading';
     status.textContent = 'Starting store scan...';
+    status.style.display = 'block';
 
     try {
       var res = await fetch('/app/scan', {
@@ -350,19 +350,52 @@ const APP_JS = `(function() {
       });
       var data = await res.json();
       if (res.ok) {
-        status.className = 'success';
-        status.textContent = 'Scan started! Scanning ' + (data.data.productCount || 0) + ' products. Results will appear shortly.';
+        var scanId = data.data.scanId;
+        var total = data.data.productCount || 0;
+        status.className = 'loading';
+        status.textContent = 'Scanning... 0/' + total + ' products';
+
+        // Poll scan-status every 2 seconds
+        var pollInterval = setInterval(async function() {
+          try {
+            var pollRes = await fetch('/app/scan-status?scanId=' + encodeURIComponent(scanId));
+            var pollData = await pollRes.json();
+            if (pollRes.ok && pollData.success) {
+              var s = pollData.data;
+              if (s.status === 'complete') {
+                clearInterval(pollInterval);
+                status.className = 'success';
+                status.textContent = 'Scan complete! ' + (s.pagesTotal || total) + ' products scored. Overall: ' + (s.scoreOverall || 0) + '. Reloading...';
+                btn.disabled = false;
+                btn.textContent = 'Scan Store';
+                setTimeout(function() { window.location.reload(); }, 1500);
+              } else if (s.status === 'failed') {
+                clearInterval(pollInterval);
+                status.className = 'error';
+                status.textContent = 'Scan failed. Please try again.';
+                btn.disabled = false;
+                btn.textContent = 'Scan Store';
+              } else {
+                status.className = 'loading';
+                status.textContent = 'Scanning... ' + (s.pagesScanned || 0) + '/' + (s.pagesTotal || total) + ' products';
+              }
+            }
+          } catch(pollErr) {
+            // Ignore transient poll errors
+          }
+        }, 2000);
       } else {
         status.className = 'error';
         status.textContent = data.error || 'Scan failed. Please try again.';
+        btn.disabled = false;
+        btn.textContent = 'Scan Store';
       }
     } catch(e) {
       status.className = 'error';
       status.textContent = 'Network error. Please check your connection.';
+      btn.disabled = false;
+      btn.textContent = 'Scan Store';
     }
-
-    btn.disabled = false;
-    btn.textContent = 'Scan Store';
   };
 
   /* ---- Settings: install script tags ---- */
@@ -621,7 +654,10 @@ appRoute.use("*", async (c, next) => {
   }
 
   const apiKey = env.SHOPIFY_API_KEY ?? "";
-  const isDocumentRequest = c.req.method === "GET";
+  // App Bridge adds Authorization: Bearer to all fetch() calls (including GET).
+  // Treat requests with Authorization header as fetch requests, not document loads.
+  const hasAuthHeader = Boolean(c.req.header("authorization"));
+  const isDocumentRequest = c.req.method === "GET" && !hasAuthHeader;
 
   // ── FETCH / XHR requests (from App Bridge) ──────────────────────
   if (!isDocumentRequest) {
@@ -773,7 +809,7 @@ appRoute.post("/sync", async (c) => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  POST /scan  — Trigger AI scan of all synced products              */
+/*  POST /scan  — Score all synced products from DB (heuristic)       */
 /* ------------------------------------------------------------------ */
 
 appRoute.post("/scan", async (c) => {
@@ -783,28 +819,19 @@ appRoute.post("/scan", async (c) => {
     return c.json({ success: false, error: "Database not configured." }, 503);
   }
 
-  // Look up all synced products for this store that have a URL
-  const storeProducts = await db
-    .select({ url: products.url })
+  // Count synced products for this store
+  const countRows = await db
+    .select({ count: sql<number>`count(*)::int` })
     .from(products)
     .where(eq(products.storeId, store.id));
+  const productCount = countRows[0]?.count ?? 0;
 
-  const urls = storeProducts.map((p) => p.url).filter(Boolean);
-
-  if (urls.length === 0) {
+  if (productCount === 0) {
     return c.json({
       success: false,
       error: "No products synced yet. Sync your products first.",
     }, 400);
   }
-
-  // Look up the account email for the scan payload
-  const account = store.accountId
-    ? await db.query.accounts.findFirst({
-        where: eq(accounts.id, store.accountId),
-      })
-    : null;
-  const email = account?.email ?? `${store.shopifyShop ?? "store"}@shop.findable`;
 
   // Create a scan record
   const inserted = await db
@@ -813,9 +840,9 @@ appRoute.post("/scan", async (c) => {
       accountId: store.accountId,
       storeId: store.id,
       scanType: "full",
-      status: "queued",
-      urlsInput: urls,
-      pagesTotal: urls.length,
+      status: "scanning",
+      pagesTotal: productCount,
+      startedAt: new Date(),
     })
     .returning({ id: scans.id });
 
@@ -824,23 +851,253 @@ appRoute.post("/scan", async (c) => {
     return c.json({ success: false, error: "Failed to create scan record." }, 500);
   }
 
-  // Process scan directly for small stores (< 50 products)
-  // to avoid Redis/BullMQ reliability issues
-  const { processScanJob } = await import("../workers/scan-worker");
-  processScanJob({
-    scanId: scanRecord.id,
-    urls,
-    email,
-  }).catch((err) => console.error("[app/scan] Scan failed:", err));
+  // Fire-and-forget: score all products from DB data (no HTTP, no AI)
+  scoreProductsFromDb(scanRecord.id, store.id).catch((err) =>
+    console.error("[app/scan] Background scan failed:", err),
+  );
 
   return c.json({
     success: true,
     data: {
       scanId: scanRecord.id,
-      productCount: urls.length,
+      productCount,
     },
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  GET /scan-status  — Poll scan progress                            */
+/* ------------------------------------------------------------------ */
+
+appRoute.get("/scan-status", async (c) => {
+  if (!db) {
+    return c.json({ success: false, error: "Database not configured." }, 503);
+  }
+
+  const scanId = c.req.query("scanId");
+  if (!scanId) {
+    return c.json({ success: false, error: "scanId is required." }, 400);
+  }
+
+  const scan = await db.query.scans.findFirst({
+    where: eq(scans.id, scanId),
+  });
+
+  if (!scan) {
+    return c.json({ success: false, error: "Scan not found." }, 404);
+  }
+
+  return c.json({
+    success: true,
+    data: {
+      status: scan.status,
+      pagesScanned: scan.pagesScanned,
+      pagesTotal: scan.pagesTotal,
+      scoreOverall: scan.scoreOverall,
+      scoreSchema: scan.scoreSchema,
+      scoreLlm: scan.scoreLlm,
+      scoreProtocol: scan.scoreProtocol,
+    },
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Background: score products from DB fields (heuristic, no AI)      */
+/* ------------------------------------------------------------------ */
+
+interface ScoredIssue {
+  severity: "critical" | "high" | "medium" | "low";
+  title: string;
+  dimension: "schema" | "llm" | "protocol";
+  pointsImpact: number;
+}
+
+function scoreProductFromDb(product: {
+  hasJsonld: boolean;
+  hasGtin: boolean;
+  hasBrand: boolean;
+  hasShippingSchema: boolean;
+  hasReturnSchema: boolean;
+  hasReviewSchema: boolean;
+  hasFaqSchema: boolean;
+  hasVariantsStructured: boolean;
+  hasMaterial: boolean;
+  hasColor: boolean;
+  hasSize: boolean;
+  originalDescription: string | null;
+}): { schema: number; llm: number; protocol: number; issues: ScoredIssue[] } {
+  const scoredIssues: ScoredIssue[] = [];
+  let schema = 18; // base
+  let llm = 22; // base
+  let protocol = 10; // base
+
+  // Schema scoring
+  if (product.hasJsonld) schema += 12;
+  else scoredIssues.push({ severity: "critical", title: "No JSON-LD schema detected", dimension: "schema", pointsImpact: 12 });
+
+  if (product.hasGtin) schema += 10;
+  else scoredIssues.push({ severity: "medium", title: "Missing GTIN/barcode", dimension: "schema", pointsImpact: 10 });
+
+  if (product.hasBrand) schema += 8;
+  else scoredIssues.push({ severity: "high", title: "Missing brand", dimension: "schema", pointsImpact: 8 });
+
+  if (product.hasShippingSchema) schema += 7;
+  else scoredIssues.push({ severity: "high", title: "Missing shipping information", dimension: "schema", pointsImpact: 7 });
+
+  if (product.hasReturnSchema) schema += 7;
+  else scoredIssues.push({ severity: "high", title: "Missing return policy", dimension: "schema", pointsImpact: 7 });
+
+  if (product.hasReviewSchema) schema += 6;
+  else scoredIssues.push({ severity: "medium", title: "No review/rating schema", dimension: "schema", pointsImpact: 6 });
+
+  if (product.hasFaqSchema) schema += 4;
+
+  if (product.hasVariantsStructured) schema += 4;
+
+  // LLM scoring
+  const desc = product.originalDescription ?? "";
+  const descLength = desc.length;
+  llm += Math.min(26, Math.floor(descLength / 12)); // up to 26 points for description length
+
+  if (product.hasBrand) llm += 8;
+  if (product.hasFaqSchema) llm += 12;
+  if (product.hasMaterial || product.hasColor || product.hasSize) llm += 10;
+  if (product.hasReviewSchema) llm += 10;
+
+  if (descLength < 100)
+    scoredIssues.push({ severity: "high", title: "Description too short for AI discovery", dimension: "llm", pointsImpact: 15 });
+
+  // Protocol scoring
+  if (product.hasJsonld) protocol += 20;
+  if (product.hasShippingSchema) protocol += 12;
+  if (product.hasReturnSchema) protocol += 12;
+  if (product.hasGtin) protocol += 10;
+  protocol += 8; // canonical URL (assume present for Shopify)
+
+  // Cap at 100
+  schema = Math.min(100, schema);
+  llm = Math.min(100, llm);
+  protocol = Math.min(100, protocol);
+
+  return { schema, llm, protocol, issues: scoredIssues };
+}
+
+async function scoreProductsFromDb(scanId: string, storeId: string): Promise<void> {
+  if (!db) return;
+
+  try {
+    // Fetch all products for this store
+    const allProducts = await db
+      .select({
+        id: products.id,
+        hasJsonld: products.hasJsonld,
+        hasGtin: products.hasGtin,
+        hasBrand: products.hasBrand,
+        hasShippingSchema: products.hasShippingSchema,
+        hasReturnSchema: products.hasReturnSchema,
+        hasReviewSchema: products.hasReviewSchema,
+        hasFaqSchema: products.hasFaqSchema,
+        hasVariantsStructured: products.hasVariantsStructured,
+        hasMaterial: products.hasMaterial,
+        hasColor: products.hasColor,
+        hasSize: products.hasSize,
+        originalDescription: products.originalDescription,
+      })
+      .from(products)
+      .where(eq(products.storeId, storeId));
+
+    let totalSchema = 0;
+    let totalLlm = 0;
+    let totalProtocol = 0;
+    let processed = 0;
+
+    for (const product of allProducts) {
+      const result = scoreProductFromDb(product);
+
+      // Update product scores
+      await db
+        .update(products)
+        .set({
+          schemaScore: result.schema,
+          llmScore: result.llm,
+          scanId: scanId,
+        })
+        .where(eq(products.id, product.id));
+
+      // Delete old issues for this product, then insert new ones
+      await db.delete(issues).where(eq(issues.productId, product.id));
+
+      if (result.issues.length > 0) {
+        await db.insert(issues).values(
+          result.issues.map((issue) => ({
+            scanId: scanId,
+            productId: product.id,
+            severity: issue.severity,
+            dimension: issue.dimension,
+            code: issue.title.toLowerCase().replace(/[^a-z0-9]+/g, "_"),
+            title: issue.title,
+            description: issue.title,
+            pointsImpact: issue.pointsImpact,
+          })),
+        );
+      }
+
+      processed++;
+      totalSchema += result.schema;
+      totalLlm += result.llm;
+      totalProtocol += result.protocol;
+
+      // Update scan progress every product (fast enough since no I/O per product)
+      if (processed % 50 === 0 || processed === allProducts.length) {
+        const avgSchema = Math.round(totalSchema / processed);
+        const avgLlm = Math.round(totalLlm / processed);
+        const avgProtocol = Math.round(totalProtocol / processed);
+        const avgOverall = Math.round((avgSchema + avgLlm + avgProtocol) / 3);
+
+        await db
+          .update(scans)
+          .set({
+            pagesScanned: processed,
+            scoreSchema: avgSchema,
+            scoreLlm: avgLlm,
+            scoreProtocol: avgProtocol,
+            scoreOverall: avgOverall,
+          })
+          .where(eq(scans.id, scanId));
+      }
+    }
+
+    // Final update: mark scan complete
+    const avgSchema = allProducts.length > 0 ? Math.round(totalSchema / allProducts.length) : 0;
+    const avgLlm = allProducts.length > 0 ? Math.round(totalLlm / allProducts.length) : 0;
+    const avgProtocol = allProducts.length > 0 ? Math.round(totalProtocol / allProducts.length) : 0;
+    const avgOverall = Math.round((avgSchema + avgLlm + avgProtocol) / 3);
+
+    await db
+      .update(scans)
+      .set({
+        status: "complete",
+        pagesScanned: allProducts.length,
+        scoreSchema: avgSchema,
+        scoreLlm: avgLlm,
+        scoreProtocol: avgProtocol,
+        scoreOverall: avgOverall,
+        completedAt: new Date(),
+      })
+      .where(eq(scans.id, scanId));
+
+    console.log(
+      `[app/scan] Scan ${scanId} complete: ${allProducts.length} products scored (schema=${avgSchema} llm=${avgLlm} protocol=${avgProtocol} overall=${avgOverall})`,
+    );
+  } catch (err) {
+    console.error(`[app/scan] Scan ${scanId} failed:`, err);
+    // Mark scan as failed
+    await db
+      ?.update(scans)
+      .set({ status: "failed" })
+      .where(eq(scans.id, scanId));
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /*  POST /script-tags  — Install script tags                          */
