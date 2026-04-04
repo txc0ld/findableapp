@@ -18,6 +18,11 @@ import {
   verifyShopifyQueryHmac,
   verifyShopifyWebhookHmac,
 } from "../lib/shopify";
+import { decryptAccessToken } from "../lib/shopify-client";
+import { handleCustomersDataRequest, handleCustomersRedact, handleShopRedact } from "../services/gdpr-handlers";
+import { syncAllProducts, syncSingleProduct, getShopInfo } from "../services/product-sync";
+import { pollBulkOperation, processBulkResults } from "../services/bulk-operations";
+import { installScriptTag } from "../services/script-tags";
 
 const shopifyRoute = new Hono();
 
@@ -224,6 +229,25 @@ shopifyRoute.get("/callback", async (c) => {
 
   await registerShopifyWebhooks(parseResult.data.shop, tokenResponse.access_token);
 
+  // Post-install: kick off initial product sync and script tag install (fire and forget)
+  const storeId = existingStore?.id ?? (
+    await db.query.stores.findFirst({
+      where: eq(stores.shopifyShop, parseResult.data.shop),
+      orderBy: [desc(stores.updatedAt)],
+      columns: { id: true },
+    })
+  )?.id;
+
+  if (storeId) {
+    getShopInfo(parseResult.data.shop, tokenResponse.access_token)
+      .then((shopInfo) =>
+        syncAllProducts(parseResult.data.shop, tokenResponse.access_token, storeId, shopInfo.currencyCode),
+      )
+      .catch(console.error);
+
+    installScriptTag(parseResult.data.shop, tokenResponse.access_token, storeId).catch(console.error);
+  }
+
   const redirectUrl = new URL("/dashboard/settings", env.FRONTEND_URL);
   redirectUrl.searchParams.set("shopify", "connected");
   redirectUrl.searchParams.set("shop", parseResult.data.shop);
@@ -309,6 +333,15 @@ shopifyRoute.post("/webhooks", async (c) => {
           .where(eq(stores.id, store.id));
       }
       break;
+    case "customers/data_request":
+      await handleCustomersDataRequest(store?.id ?? null, payload as unknown as Parameters<typeof handleCustomersDataRequest>[1]);
+      break;
+    case "customers/redact":
+      await handleCustomersRedact(payload as unknown as Parameters<typeof handleCustomersRedact>[0]);
+      break;
+    case "shop/redact":
+      await handleShopRedact(store?.id ?? null, payload as unknown as Parameters<typeof handleShopRedact>[1]);
+      break;
     case "products/delete":
       if (store) {
         const numericId =
@@ -351,6 +384,33 @@ shopifyRoute.post("/webhooks", async (c) => {
           severity: "info",
           storeId: store.id,
         });
+
+        // Fire-and-forget single product sync
+        if (store.shopifyAccessToken) {
+          const accessToken = decryptAccessToken(store.shopifyAccessToken);
+          const gid =
+            typeof payload.admin_graphql_api_id === "string"
+              ? payload.admin_graphql_api_id
+              : `gid://shopify/Product/${payload.id}`;
+          syncSingleProduct(shop, accessToken, store.id, gid, "USD").catch(console.error);
+        }
+      }
+      break;
+    case "bulk_operations/finish":
+      if (store?.shopifyAccessToken) {
+        const accessToken = decryptAccessToken(store.shopifyAccessToken);
+        const opId = typeof payload.admin_graphql_api_id === "string"
+          ? payload.admin_graphql_api_id
+          : null;
+
+        if (opId) {
+          (async () => {
+            const status = await pollBulkOperation(shop, accessToken, opId);
+            if (status.status === "COMPLETED" && status.url) {
+              await processBulkResults(status.url, store.id, shop, "USD");
+            }
+          })().catch(console.error);
+        }
       }
       break;
     default:

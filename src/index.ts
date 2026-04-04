@@ -6,7 +6,10 @@ import { accountRoute } from "./routes/account";
 import { authRoute } from "./routes/auth";
 import { healthRoute } from "./routes/health";
 import { scanRoute } from "./routes/scan";
+import { schemaApiRoute } from "./routes/schema-api";
 import { shopifyRoute } from "./routes/shopify";
+import { shopifyBillingRoute } from "./routes/shopify-billing";
+import { storeOpsRoute } from "./routes/store-ops";
 
 const app = new Hono();
 const allowedOrigins = (
@@ -40,8 +43,7 @@ app.get("/", (c) =>
     success: true,
     data: {
       service: "findable-api",
-      version: "0.1.0",
-      docs: "Phase 1 Step 1 scaffold",
+      version: "1.0.0",
     },
   }),
 );
@@ -50,7 +52,10 @@ app.route("/api/health", healthRoute);
 app.route("/api/auth", authRoute);
 app.route("/api/account", accountRoute);
 app.route("/api/scan", scanRoute);
+app.route("/api/schema", schemaApiRoute);
 app.route("/api/shopify", shopifyRoute);
+app.route("/api/shopify/billing", shopifyBillingRoute);
+app.route("/api/shopify/store", storeOpsRoute);
 app.route("/shopify", shopifyRoute);
 
 export type AppType = typeof app;
