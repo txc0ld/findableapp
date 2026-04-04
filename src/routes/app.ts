@@ -11,6 +11,7 @@ import { syncAllProducts, getProductCount, getShopInfo } from "../services/produ
 import { startBulkProductSync } from "../services/bulk-operations";
 import { installScriptTag } from "../services/script-tags";
 import { enqueueScanJob } from "../lib/queue";
+import { testLlmVisibility } from "../services/llm-tester";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -347,6 +348,77 @@ const APP_JS = `(function() {
     btn.disabled = false;
     btn.textContent = 'Install Script Tags';
   };
+
+  /* ---- Dashboard: LLM visibility test ---- */
+  window.findableTestVisibility = async function() {
+    var btn = document.getElementById('visibility-btn');
+    var status = document.getElementById('visibility-status');
+    var resultsDiv = document.getElementById('visibility-results');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    status.style.display = 'block';
+    status.style.background = '#eff6ff';
+    status.style.color = '#2563eb';
+    status.textContent = 'Running LLM visibility tests (this may take 15-30 seconds)...';
+    if (resultsDiv) resultsDiv.innerHTML = '';
+
+    try {
+      var res = await fetch('/app/visibility-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok && data.success) {
+        var report = data.data;
+        var pct = Math.round(report.mentionRate * 100);
+        var color = pct >= 50 ? '#16a34a' : pct >= 20 ? '#d97706' : '#dc2626';
+        status.style.background = '#f0fdf4';
+        status.style.color = '#16a34a';
+        status.textContent = 'Visibility test complete!';
+
+        if (resultsDiv) {
+          var html = '<div style="margin-top:16px;">';
+          html += '<div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;">';
+          html += '<div style="font-size:48px;font-weight:800;color:' + color + ';">' + pct + '%</div>';
+          html += '<div><div style="font-size:14px;font-weight:600;">LLM Mention Rate</div>';
+          html += '<div style="font-size:12px;color:#6b7280;">Brand &ldquo;' + report.brandName + '&rdquo; mentioned in ' + report.mentionCount + ' of ' + report.testsRun + ' tests</div></div>';
+          html += '</div>';
+
+          for (var i = 0; i < report.results.length; i++) {
+            var r = report.results[i];
+            var badge = r.mentioned
+              ? '<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">MENTIONED</span>'
+              : '<span style="background:#fef2f2;color:#dc2626;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">NOT FOUND</span>';
+            html += '<div style="background:#f9fafb;border-radius:8px;padding:12px;margin-bottom:8px;">';
+            html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">' + badge;
+            html += '<span style="font-size:13px;color:#374151;font-weight:500;">' + r.prompt + '</span></div>';
+            if (r.mentionContext) {
+              html += '<div style="font-size:12px;color:#4b5563;background:#ecfdf5;padding:8px;border-radius:4px;margin-bottom:4px;">&ldquo;' + r.mentionContext + '&rdquo;</div>';
+            }
+            if (r.competitorsMentioned && r.competitorsMentioned.length > 0) {
+              html += '<div style="font-size:11px;color:#9ca3af;">Competitors mentioned: ' + r.competitorsMentioned.join(', ') + '</div>';
+            }
+            html += '</div>';
+          }
+          html += '</div>';
+          resultsDiv.innerHTML = html;
+        }
+      } else {
+        status.style.background = '#fef2f2';
+        status.style.color = '#dc2626';
+        status.textContent = data.error || 'Visibility test failed. Please try again.';
+      }
+    } catch(e) {
+      status.style.background = '#fef2f2';
+      status.style.color = '#dc2626';
+      status.textContent = 'Network error. Please check your connection.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Test LLM Visibility';
+  };
 })();
 `;
 
@@ -577,6 +649,92 @@ appRoute.post("/script-tags", async (c) => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  POST /visibility-test  — LLM visibility testing (Pro tier)        */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/visibility-test", async (c) => {
+  const store = c.get("shopifyStore");
+
+  if (!db) {
+    return c.json({ success: false, error: "Database not configured." }, 503);
+  }
+
+  if (!env.OPENAI_API_KEY) {
+    return c.json({ success: false, error: "OpenAI API key not configured." }, 503);
+  }
+
+  // Get brand name from store name (fallback to shop domain)
+  let brandName = store.name ?? store.shopifyShop?.replace(".myshopify.com", "") ?? "Unknown";
+
+  // Try to get vendor from the first product's extractedAttributes
+  const firstProduct = await db
+    .select({
+      name: products.name,
+      extractedAttributes: products.extractedAttributes,
+      googleCategory: products.googleCategory,
+    })
+    .from(products)
+    .where(eq(products.storeId, store.id))
+    .limit(5);
+
+  if (firstProduct.length === 0) {
+    return c.json({
+      success: false,
+      error: "No products synced yet. Sync your products first.",
+    }, 400);
+  }
+
+  // Use the vendor from the first product if available
+  const firstAttrs = firstProduct[0]?.extractedAttributes as Record<string, unknown> | null;
+  if (firstAttrs?.vendor && typeof firstAttrs.vendor === "string" && firstAttrs.vendor.length > 0) {
+    brandName = firstAttrs.vendor;
+  }
+
+  // Determine product categories from extractedAttributes
+  const categorySet = new Set<string>();
+  for (const p of firstProduct) {
+    const attrs = p.extractedAttributes as Record<string, unknown> | null;
+    if (attrs?.productType && typeof attrs.productType === "string" && attrs.productType.length > 0) {
+      categorySet.add(attrs.productType);
+    }
+    if (p.googleCategory) {
+      categorySet.add(p.googleCategory);
+    }
+  }
+
+  // Fallback to a generic category from product names
+  const productCategory = categorySet.size > 0
+    ? Array.from(categorySet)[0]!
+    : "products";
+
+  // Build 3-5 use cases for testing
+  const defaultUseCases = [
+    "everyday use",
+    "beginners",
+    "professionals",
+    "value for money",
+    "sustainability",
+  ];
+  const useCases = defaultUseCases.slice(0, Math.min(5, Math.max(3, defaultUseCases.length)));
+
+  try {
+    const report = await testLlmVisibility({
+      brandName,
+      productCategory,
+      useCases,
+    });
+
+    return c.json({ success: true, data: report });
+  } catch (err) {
+    console.error("[app] Visibility test error:", err);
+    return c.json({
+      success: false,
+      error: err instanceof Error ? err.message : "Visibility test failed.",
+    }, 500);
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /*  GET /  — Dashboard home                                           */
 /* ------------------------------------------------------------------ */
 
@@ -699,6 +857,16 @@ appRoute.get("/", async (c) => {
     <div class="card">
       <h2 class="card-title">Top Issues</h2>
       ${issuesHtml}
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">LLM Visibility Test <span style="background: #ede9fe; color: #7c3aed; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; vertical-align: middle;">PRO</span></h2>
+      <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px;">Test whether AI assistants (ChatGPT, etc.) recommend your brand when shoppers ask questions about your product category.</p>
+      <div class="actions">
+        <button class="btn" id="visibility-btn" onclick="findableTestVisibility()" style="background: #7c3aed; color: white;">Test LLM Visibility</button>
+      </div>
+      <div id="visibility-status" style="display: none; margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 13px;"></div>
+      <div id="visibility-results"></div>
     </div>
 
   `;
