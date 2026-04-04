@@ -756,6 +756,19 @@ appRoute.use("*", async (c, next) => {
     console.log(`[app] id_token verified for shop: ${shop}`);
   } catch (err) {
     console.error("[app] id_token verification failed:", err);
+    // Token expired/invalid — fall back to shop param if store exists
+    const shopFallback = c.req.query("shop")?.replace(/^https?:\/\//, "");
+    if (shopFallback) {
+      const existingStore = await db.query.stores.findFirst({
+        where: eq(stores.shopifyShop, shopFallback),
+      });
+      if (existingStore) {
+        console.log(`[app] Expired id_token but store exists for ${shopFallback} — serving page`);
+        c.set("shopifyStore", existingStore);
+        c.set("shopifyShop", shopFallback);
+        return next();
+      }
+    }
     return c.html(bouncePage(apiKey));
   }
 
