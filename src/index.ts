@@ -59,6 +59,7 @@ app.route("/api/shopify", shopifyRoute);
 app.route("/api/shopify/billing", shopifyBillingRoute);
 app.route("/api/shopify/store", storeOpsRoute);
 app.route("/api/proxy", proxyRoute);
+app.route("/proxy/findable", proxyRoute);
 app.route("/app", appRoute);
 app.route("/shopify", shopifyRoute);
 

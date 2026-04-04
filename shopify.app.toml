@@ -34,7 +34,7 @@ topics = [
 uri = "https://api.getfindable.au/shopify/webhooks"
 
 [app_proxy]
-url = "https://api.getfindable.au/api/proxy"
+url = "https://api.getfindable.au/proxy/findable"
 subpath = "findable"
 prefix = "apps"
 # Accessible at: https://your-store.myshopify.com/apps/findable/*
