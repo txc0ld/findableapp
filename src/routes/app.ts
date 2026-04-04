@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, desc, and, sql, inArray } from "drizzle-orm";
+import { eq, desc, and, sql, inArray, or, lt } from "drizzle-orm";
 
 import { db } from "../db/client";
 import { accounts, stores, products, issues, scans, type Store } from "../db/schema";
@@ -12,6 +12,11 @@ import { startBulkProductSync } from "../services/bulk-operations";
 import { installScriptTag } from "../services/script-tags";
 import { enqueueScanJob } from "../lib/queue";
 import { testLlmVisibility } from "../services/llm-tester";
+import { analyzeWithAi } from "../services/ai-analyzer";
+import type { AiAnalysisInput } from "../services/ai-analyzer";
+import { auditEntityConsistency } from "../services/entity-audit";
+import { detectMismatches } from "../services/mismatch-detector";
+import type { MappedProduct } from "../types/shopify";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -90,6 +95,34 @@ function renderPage(title: string, content: string, apiKey: string): string {
     #sync-status.success { display: block; background: #f0fdf4; color: #16a34a; }
     #sync-status.error { display: block; background: #fef2f2; color: #dc2626; }
     #sync-status.loading { display: block; background: #eff6ff; color: #2563eb; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .badge-marketing { background: #fef3c7; color: #92400e; }
+    .badge-factual { background: #d1fae5; color: #065f46; }
+    .badge-mixed { background: #e0e7ff; color: #3730a3; }
+    .badge-success { background: #dcfce7; color: #16a34a; }
+    .badge-warning { background: #fef9c3; color: #854d0e; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .detail-grid.full { grid-template-columns: 1fr; }
+    .side-by-side { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 768px) { .detail-grid, .side-by-side { grid-template-columns: 1fr; } }
+    .desc-box { background: #f9fafb; border-radius: 8px; padding: 16px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
+    .schema-preview { background: #1e1e2e; color: #cdd6f4; border-radius: 8px; padding: 16px; font-size: 12px; font-family: monospace; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; }
+    .faq-item { background: #f9fafb; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+    .faq-q { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+    .faq-a { font-size: 13px; color: #4b5563; }
+    .attr-tag { display: inline-block; padding: 2px 8px; background: #f3f4f6; border-radius: 4px; font-size: 12px; margin: 2px; }
+    .attr-tag.missing { background: #fef2f2; color: #dc2626; }
+    .step-card { background: #f9fafb; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+    .step-number { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; background: #4f46e5; color: white; font-size: 14px; font-weight: 700; margin-right: 12px; }
+    .step-title { font-size: 15px; font-weight: 600; }
+    .step-desc { font-size: 13px; color: #4b5563; margin-top: 8px; line-height: 1.6; }
+    .code-block { background: #1e1e2e; color: #cdd6f4; border-radius: 6px; padding: 8px 12px; font-size: 12px; font-family: monospace; word-break: break-all; margin-top: 8px; }
+    .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 16px; }
+    .health-card { background: #f9fafb; border-radius: 8px; padding: 16px; }
+    .health-title { font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 8px; }
+    .health-value { font-size: 24px; font-weight: 700; }
+    .health-desc { font-size: 12px; color: #6b7280; margin-top: 4px; }
+    .action-status { display: none; margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -97,6 +130,7 @@ function renderPage(title: string, content: string, apiKey: string): string {
     <nav class="nav">
       <a href="/app" class="${title === "Dashboard" ? "active" : ""}">Dashboard</a>
       <a href="/app/products" class="${title === "Products" ? "active" : ""}">Products</a>
+      <a href="/app/setup" class="${title === "Setup" ? "active" : ""}">Setup</a>
       <a href="/app/settings" class="${title === "Settings" ? "active" : ""}">Settings</a>
     </nav>
     ${content}
@@ -347,6 +381,124 @@ const APP_JS = `(function() {
 
     btn.disabled = false;
     btn.textContent = 'Install Script Tags';
+  };
+
+  /* ---- Product Detail: auto-fix ---- */
+  window.findableAutoFix = async function(productId) {
+    var btn = document.getElementById('fix-btn');
+    var status = document.getElementById('fix-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Fixing...';
+    status.style.display = 'block';
+    status.style.background = '#eff6ff';
+    status.style.color = '#2563eb';
+    status.textContent = 'Running AI analysis... this may take 15-30 seconds.';
+
+    try {
+      var res = await fetch('/app/products/' + productId + '/fix', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok && data.success) {
+        status.style.background = '#f0fdf4';
+        status.style.color = '#16a34a';
+        status.textContent = 'Product fixed! New AEO score: ' + (data.data.aeoScore || 'N/A') + '. Reloading...';
+        setTimeout(function() { window.location.reload(); }, 1500);
+      } else {
+        status.style.background = '#fef2f2';
+        status.style.color = '#dc2626';
+        status.textContent = data.error || 'Auto-fix failed. Please try again.';
+      }
+    } catch(e) {
+      status.style.background = '#fef2f2';
+      status.style.color = '#dc2626';
+      status.textContent = 'Network error. Please check your connection.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Auto-Fix This Product';
+  };
+
+  /* ---- Product Detail: restore original ---- */
+  window.findableRestore = async function(productId) {
+    if (!confirm('Restore this product to its pre-fix state?')) return;
+    var btn = document.getElementById('restore-btn');
+    var status = document.getElementById('fix-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Restoring...';
+    status.style.display = 'block';
+    status.style.background = '#eff6ff';
+    status.style.color = '#2563eb';
+    status.textContent = 'Restoring original data...';
+
+    try {
+      var res = await fetch('/app/products/' + productId + '/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok && data.success) {
+        status.style.background = '#f0fdf4';
+        status.style.color = '#16a34a';
+        status.textContent = 'Restored to original. Reloading...';
+        setTimeout(function() { window.location.reload(); }, 1500);
+      } else {
+        status.style.background = '#fef2f2';
+        status.style.color = '#dc2626';
+        status.textContent = data.error || 'Restore failed.';
+      }
+    } catch(e) {
+      status.style.background = '#fef2f2';
+      status.style.color = '#dc2626';
+      status.textContent = 'Network error.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Restore Original';
+  };
+
+  /* ---- Dashboard: bulk fix all ---- */
+  window.findableFixAll = async function() {
+    if (!confirm('Run AI auto-fix on ALL products? This may take a while.')) return;
+    var btn = document.getElementById('fix-all-btn');
+    var status = document.getElementById('fix-all-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+    status.style.display = 'block';
+    status.style.background = '#eff6ff';
+    status.style.color = '#2563eb';
+    status.textContent = 'Queuing bulk AI fix...';
+
+    try {
+      var res = await fetch('/app/fix-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok && data.success) {
+        status.style.background = '#f0fdf4';
+        status.style.color = '#16a34a';
+        status.textContent = 'Bulk fix started for ' + (data.data.productCount || 0) + ' products. Processing in background — results will appear when complete.';
+      } else {
+        status.style.background = '#fef2f2';
+        status.style.color = '#dc2626';
+        status.textContent = data.error || 'Bulk fix failed.';
+      }
+    } catch(e) {
+      status.style.background = '#fef2f2';
+      status.style.color = '#dc2626';
+      status.textContent = 'Network error.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Fix All Products';
   };
 
   /* ---- Dashboard: LLM visibility test ---- */
@@ -783,6 +935,45 @@ appRoute.get("/", async (c) => {
         .limit(5)
     : [];
 
+  // Products needing fixes: aeoScore < 50 or schemaScore < 50
+  const needsFixRows = db
+    ? await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(products)
+        .where(
+          and(
+            eq(products.storeId, store.id),
+            or(
+              lt(products.aeoScore, 50),
+              lt(products.schemaScore, 50),
+            ),
+          ),
+        )
+    : [];
+  const needsFixCount = needsFixRows[0]?.count ?? 0;
+
+  // Entity consistency audit (non-blocking)
+  let entityConsistent = true;
+  let entityIssueCount = 0;
+  let entityPrimaryBrand = "";
+  try {
+    const entityResult = await auditEntityConsistency(store.id);
+    entityConsistent = entityResult.consistent;
+    entityIssueCount = entityResult.issues.length;
+    entityPrimaryBrand = entityResult.primaryBrand;
+  } catch {
+    // Non-critical — ignore
+  }
+
+  // Mismatch detection (non-blocking)
+  let mismatchCount = 0;
+  try {
+    const mismatchResults = await detectMismatches(store.id);
+    mismatchCount = mismatchResults.length;
+  } catch {
+    // Non-critical — ignore
+  }
+
   const overallScore = latestScan?.scoreOverall ?? 0;
   const schemaScore = latestScan?.scoreSchema ?? 0;
   const llmScore = latestScan?.scoreLlm ?? 0;
@@ -860,6 +1051,33 @@ appRoute.get("/", async (c) => {
     </div>
 
     <div class="card">
+      <h2 class="card-title">Store Health</h2>
+      <div class="health-grid">
+        <div class="health-card">
+          <div class="health-title">Entity Consistency</div>
+          <div class="health-value" style="color: ${entityConsistent ? "#16a34a" : "#dc2626"};">${entityConsistent ? "Consistent" : `${entityIssueCount} issue${entityIssueCount !== 1 ? "s" : ""}`}</div>
+          <div class="health-desc">${entityPrimaryBrand ? `Primary brand: ${escapeHtml(entityPrimaryBrand)}` : "No brand data found"}</div>
+        </div>
+        <div class="health-card">
+          <div class="health-title">Mismatch Alerts</div>
+          <div class="health-value" style="color: ${mismatchCount === 0 ? "#16a34a" : "#dc2626"};">${mismatchCount}</div>
+          <div class="health-desc">Products with price/availability/data mismatches</div>
+        </div>
+        <div class="health-card">
+          <div class="health-title">Products Needing Fixes</div>
+          <div class="health-value" style="color: ${needsFixCount === 0 ? "#16a34a" : "#f59e0b"};">${needsFixCount}</div>
+          <div class="health-desc">Products with AEO or Schema score below 50</div>
+        </div>
+      </div>
+      ${needsFixCount > 0 ? `
+      <div class="actions" style="margin-top: 16px;">
+        <button class="btn" id="fix-all-btn" onclick="findableFixAll()" style="background: #059669; color: white;">Fix All Products</button>
+      </div>
+      <div id="fix-all-status" class="action-status"></div>
+      ` : ""}
+    </div>
+
+    <div class="card">
       <h2 class="card-title">LLM Visibility Test <span style="background: #ede9fe; color: #7c3aed; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; vertical-align: middle;">PRO</span></h2>
       <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px;">Test whether AI assistants (ChatGPT, etc.) recommend your brand when shoppers ask questions about your product category.</p>
       <div class="actions">
@@ -932,11 +1150,11 @@ appRoute.get("/products", async (c) => {
         const schema = p.schemaScore ?? 0;
         const llm = p.llmScore ?? 0;
         const count = issueCounts[p.id] ?? 0;
-        const detailUrl = `${escapeHtml(frontendUrl)}/dashboard/products/${p.id}`;
+        const detailUrl = `/app/products/${encodeURIComponent(p.id)}`;
 
         return `
           <tr>
-            <td><a href="${detailUrl}" target="_top" style="color: #4f46e5; text-decoration: none; font-weight: 500;">${name}</a></td>
+            <td><a href="${detailUrl}" style="color: #4f46e5; text-decoration: none; font-weight: 500;">${name}</a></td>
             <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"><a href="${url}" target="_blank" style="color: #6b7280; text-decoration: none; font-size: 12px;">${url}</a></td>
             <td><span style="color: ${scoreColor(schema)}; font-weight: 600;">${schema}</span></td>
             <td><span style="color: ${scoreColor(llm)}; font-weight: 600;">${llm}</span></td>
@@ -1084,6 +1302,507 @@ appRoute.get("/settings", async (c) => {
   `;
 
   return c.html(renderPage("Settings", content, apiKey));
+});
+
+/* ------------------------------------------------------------------ */
+/*  GET /products/:id  — Per-product detail page                      */
+/* ------------------------------------------------------------------ */
+
+appRoute.get("/products/:id", async (c) => {
+  const store = c.get("shopifyStore");
+  const apiKey = env.SHOPIFY_API_KEY ?? "";
+  const productId = c.req.param("id");
+
+  if (!db) {
+    return c.text("Database not configured", 503);
+  }
+
+  const product = await db.query.products.findFirst({
+    where: and(eq(products.id, productId), eq(products.storeId, store.id)),
+  });
+
+  if (!product) {
+    return c.html(renderPage("Product Not Found", `<div class="card"><div class="empty">Product not found.</div><a href="/app/products" class="btn btn-secondary" style="margin-top: 16px;">Back to Products</a></div>`, apiKey));
+  }
+
+  // Fetch issues for this product
+  const productIssues = await db
+    .select({
+      id: issues.id,
+      severity: issues.severity,
+      dimension: issues.dimension,
+      title: issues.title,
+      description: issues.description,
+      fixType: issues.fixType,
+      fixed: issues.fixed,
+    })
+    .from(issues)
+    .where(eq(issues.productId, productId))
+    .orderBy(desc(issues.createdAt));
+
+  const attrs = (product.extractedAttributes ?? {}) as Record<string, unknown>;
+  const schema = product.schemaScore ?? 0;
+  const llm = product.llmScore ?? 0;
+  const aeo = product.aeoScore ?? 0;
+  const density = product.attributeDensity != null ? Math.round(product.attributeDensity * 100) : 0;
+  const descType = product.descriptionType ?? "unknown";
+  const missing = product.missingAttributes ?? [];
+  const faqs = product.suggestedFaq as Array<{ question: string; answer: string }> | null;
+  const generatedSchema = product.generatedSchema;
+  const hasBackup = !!(attrs._backup);
+
+  // Description type badge
+  const descBadgeClass = descType === "factual" ? "badge-factual" : descType === "marketing" ? "badge-marketing" : "badge-mixed";
+
+  // Issues HTML
+  const unfixedIssues = productIssues.filter((i) => !i.fixed);
+  const issuesHtml = unfixedIssues.length > 0
+    ? unfixedIssues.map((issue) => `
+      <div class="issue-row">
+        <span class="severity severity-${issue.severity ?? "medium"}" style="margin-right: 12px;">${escapeHtml(issue.severity ?? "medium")}</span>
+        <span style="flex: 1;">
+          <strong>${escapeHtml(issue.title)}</strong>
+          <div style="font-size: 12px; color: #6b7280; margin-top: 2px;">${escapeHtml(issue.description)}</div>
+        </span>
+        <span style="font-size: 12px; color: #9ca3af;">${escapeHtml(issue.dimension ?? "")}</span>
+      </div>`).join("")
+    : '<div class="empty">No open issues for this product.</div>';
+
+  // Missing attributes HTML
+  const missingHtml = missing.length > 0
+    ? missing.map((a) => `<span class="attr-tag missing">${escapeHtml(a)}</span>`).join("")
+    : '<span style="color: #16a34a; font-size: 13px;">No missing attributes detected.</span>';
+
+  // FAQs HTML
+  const faqsHtml = faqs && faqs.length > 0
+    ? faqs.map((faq) => `
+      <div class="faq-item">
+        <div class="faq-q">Q: ${escapeHtml(faq.question)}</div>
+        <div class="faq-a">${escapeHtml(faq.answer)}</div>
+      </div>`).join("")
+    : '<div style="color: #9ca3af; font-size: 13px;">No FAQs generated yet. Run Auto-Fix to generate.</div>';
+
+  // Schema preview HTML
+  const schemaHtml = generatedSchema
+    ? `<div class="schema-preview">${escapeHtml(JSON.stringify(generatedSchema, null, 2))}</div>`
+    : '<div style="color: #9ca3af; font-size: 13px;">No schema generated yet. Run Auto-Fix to generate.</div>';
+
+  // Product image
+  const images = (attrs.images as Array<{ url: string; alt: string | null }>) ?? [];
+  const imageUrl = images.length > 0 ? images[0]!.url : null;
+
+  const content = `
+    <div style="margin-bottom: 16px;">
+      <a href="/app/products" style="color: #6b7280; text-decoration: none; font-size: 14px;">&larr; Back to Products</a>
+    </div>
+
+    <div class="card">
+      <div style="display: flex; gap: 20px; align-items: flex-start;">
+        ${imageUrl ? `<img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(product.name ?? "")}" style="width: 100px; height: 100px; object-fit: cover; border-radius: 8px; flex-shrink: 0;" />` : ""}
+        <div style="flex: 1;">
+          <h2 class="card-title" style="margin-bottom: 8px;">${escapeHtml(product.name ?? "Untitled")}</h2>
+          <a href="${escapeHtml(product.url)}" target="_blank" style="color: #6b7280; font-size: 13px; word-break: break-all;">${escapeHtml(product.url)}</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Scores</h2>
+      <div class="dimensions">
+        <div class="dim-card">
+          <div class="dim-score" style="color: ${scoreColor(schema)};">${schema}</div>
+          <div class="dim-label">Schema</div>
+        </div>
+        <div class="dim-card">
+          <div class="dim-score" style="color: ${scoreColor(llm)};">${llm}</div>
+          <div class="dim-label">LLM Readiness</div>
+        </div>
+        <div class="dim-card">
+          <div class="dim-score" style="color: ${scoreColor(aeo)};">${aeo}</div>
+          <div class="dim-label">AEO Score</div>
+        </div>
+      </div>
+      <div class="detail-grid" style="margin-top: 16px;">
+        <div class="stat-row">
+          <span class="stat-label">Attribute Density</span>
+          <span class="stat-value">${density}%</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Description Type</span>
+          <span class="badge ${descBadgeClass}">${escapeHtml(descType)}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Issues (${unfixedIssues.length})</h2>
+      ${issuesHtml}
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Missing Attributes</h2>
+      <div style="margin-top: 8px;">${missingHtml}</div>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Descriptions</h2>
+      <div class="side-by-side">
+        <div>
+          <h3 style="font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #6b7280;">Original</h3>
+          <div class="desc-box">${product.originalDescription ? escapeHtml(product.originalDescription) : '<span style="color: #9ca3af;">No original description stored.</span>'}</div>
+        </div>
+        <div>
+          <h3 style="font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #6b7280;">AI-Rewritten (AEO Optimized)</h3>
+          <div class="desc-box">${product.rewrittenDescription ? escapeHtml(product.rewrittenDescription) : '<span style="color: #9ca3af;">No rewritten description yet. Run Auto-Fix to generate.</span>'}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Suggested FAQs</h2>
+      ${faqsHtml}
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Generated Schema (JSON-LD)</h2>
+      ${schemaHtml}
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Actions</h2>
+      <div class="actions">
+        <button class="btn btn-primary" id="fix-btn" onclick="findableAutoFix('${escapeHtml(productId)}')">Auto-Fix This Product</button>
+        ${hasBackup ? `<button class="btn btn-secondary" id="restore-btn" onclick="findableRestore('${escapeHtml(productId)}')">Restore Original</button>` : ""}
+      </div>
+      <div id="fix-status" class="action-status"></div>
+    </div>
+  `;
+
+  return c.html(renderPage("Product Detail", content, apiKey));
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /products/:id/fix  — Auto-fix a single product               */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/products/:id/fix", async (c) => {
+  const store = c.get("shopifyStore");
+  const productId = c.req.param("id");
+
+  if (!db) {
+    return c.json({ success: false, error: "Database not configured." }, 503);
+  }
+
+  const product = await db.query.products.findFirst({
+    where: and(eq(products.id, productId), eq(products.storeId, store.id)),
+  });
+
+  if (!product) {
+    return c.json({ success: false, error: "Product not found." }, 404);
+  }
+
+  // Reconstruct AiAnalysisInput from DB
+  const attrs = (product.extractedAttributes ?? {}) as Record<string, unknown>;
+  const visibleAttributes: string[] = [];
+  for (const key of ["vendor", "productType", "material", "color", "size"]) {
+    if (attrs[key] && typeof attrs[key] === "string") {
+      visibleAttributes.push(`${key}: ${attrs[key] as string}`);
+    }
+  }
+
+  const aiInput: AiAnalysisInput = {
+    url: product.url,
+    productName: product.name ?? "",
+    description: product.originalDescription ?? "",
+    existingSchema: product.existingSchema ?? null,
+    visiblePrice: product.price ? parseFloat(product.price) : null,
+    visibleAttributes,
+    htmlSnippet: (attrs.descriptionHtml as string) ?? "",
+  };
+
+  const aiResult = await analyzeWithAi(aiInput);
+
+  if (!aiResult) {
+    return c.json({ success: false, error: "AI analysis failed. Check that OPENAI_API_KEY is configured." }, 500);
+  }
+
+  // Save backup before overwriting
+  const backup: Record<string, unknown> = {
+    originalDescription: product.originalDescription,
+    rewrittenDescription: product.rewrittenDescription,
+    generatedSchema: product.generatedSchema,
+    suggestedFaq: product.suggestedFaq,
+    schemaScore: product.schemaScore,
+    llmScore: product.llmScore,
+    aeoScore: product.aeoScore,
+    descriptionType: product.descriptionType,
+    attributeDensity: product.attributeDensity,
+    missingAttributes: product.missingAttributes,
+    backedUpAt: new Date().toISOString(),
+  };
+
+  const updatedAttrs = { ...attrs, _backup: backup };
+
+  // Update the product record
+  await db
+    .update(products)
+    .set({
+      rewrittenDescription: aiResult.rewrittenDescription,
+      suggestedFaq: aiResult.suggestedFaq as Record<string, unknown>[],
+      generatedSchema: aiResult.generatedSchema,
+      missingAttributes: aiResult.missingAttributes,
+      aeoScore: aiResult.aeoScore,
+      descriptionType: aiResult.descriptionType,
+      attributeDensity: aiResult.attributeDensity,
+      googleCategory: aiResult.googleCategory,
+      extractedAttributes: updatedAttrs,
+    })
+    .where(eq(products.id, productId));
+
+  return c.json({
+    success: true,
+    data: {
+      aeoScore: aiResult.aeoScore,
+      descriptionType: aiResult.descriptionType,
+      attributeDensity: aiResult.attributeDensity,
+      missingAttributes: aiResult.missingAttributes,
+    },
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /products/:id/restore  — Restore product to pre-fix state    */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/products/:id/restore", async (c) => {
+  const store = c.get("shopifyStore");
+  const productId = c.req.param("id");
+
+  if (!db) {
+    return c.json({ success: false, error: "Database not configured." }, 503);
+  }
+
+  const product = await db.query.products.findFirst({
+    where: and(eq(products.id, productId), eq(products.storeId, store.id)),
+  });
+
+  if (!product) {
+    return c.json({ success: false, error: "Product not found." }, 404);
+  }
+
+  const attrs = (product.extractedAttributes ?? {}) as Record<string, unknown>;
+  const backup = attrs._backup as Record<string, unknown> | undefined;
+
+  if (!backup) {
+    return c.json({ success: false, error: "No backup found. This product has not been auto-fixed." }, 400);
+  }
+
+  // Restore from backup
+  const { _backup: _, ...attrsWithoutBackup } = attrs;
+
+  await db
+    .update(products)
+    .set({
+      originalDescription: (backup.originalDescription as string) ?? product.originalDescription,
+      rewrittenDescription: (backup.rewrittenDescription as string | null) ?? null,
+      generatedSchema: (backup.generatedSchema as Record<string, unknown> | null) ?? null,
+      suggestedFaq: (backup.suggestedFaq as Record<string, unknown>[] | null) ?? null,
+      schemaScore: (backup.schemaScore as number | null) ?? null,
+      llmScore: (backup.llmScore as number | null) ?? null,
+      aeoScore: (backup.aeoScore as number | null) ?? null,
+      descriptionType: (backup.descriptionType as string | null) ?? null,
+      attributeDensity: (backup.attributeDensity as number | null) ?? null,
+      missingAttributes: (backup.missingAttributes as string[] | null) ?? null,
+      extractedAttributes: attrsWithoutBackup,
+    })
+    .where(eq(products.id, productId));
+
+  return c.json({ success: true });
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /fix-all  — Bulk AI fix for all products                     */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/fix-all", async (c) => {
+  const store = c.get("shopifyStore");
+
+  if (!db) {
+    return c.json({ success: false, error: "Database not configured." }, 503);
+  }
+
+  const storeProducts = await db
+    .select({ id: products.id })
+    .from(products)
+    .where(eq(products.storeId, store.id));
+
+  if (storeProducts.length === 0) {
+    return c.json({ success: false, error: "No products found. Sync your products first." }, 400);
+  }
+
+  // Process in background — return immediately
+  const productIds = storeProducts.map((p) => p.id);
+
+  // Fire-and-forget background processing
+  (async () => {
+    for (const pid of productIds) {
+      try {
+        const product = await db!.query.products.findFirst({
+          where: eq(products.id, pid),
+        });
+        if (!product) continue;
+
+        const attrs = (product.extractedAttributes ?? {}) as Record<string, unknown>;
+        const visibleAttributes: string[] = [];
+        for (const key of ["vendor", "productType", "material", "color", "size"]) {
+          if (attrs[key] && typeof attrs[key] === "string") {
+            visibleAttributes.push(`${key}: ${attrs[key] as string}`);
+          }
+        }
+
+        const aiInput: AiAnalysisInput = {
+          url: product.url,
+          productName: product.name ?? "",
+          description: product.originalDescription ?? "",
+          existingSchema: product.existingSchema ?? null,
+          visiblePrice: product.price ? parseFloat(product.price) : null,
+          visibleAttributes,
+          htmlSnippet: (attrs.descriptionHtml as string) ?? "",
+        };
+
+        const aiResult = await analyzeWithAi(aiInput);
+        if (!aiResult) continue;
+
+        // Save backup
+        const backup: Record<string, unknown> = {
+          originalDescription: product.originalDescription,
+          rewrittenDescription: product.rewrittenDescription,
+          generatedSchema: product.generatedSchema,
+          suggestedFaq: product.suggestedFaq,
+          schemaScore: product.schemaScore,
+          llmScore: product.llmScore,
+          aeoScore: product.aeoScore,
+          descriptionType: product.descriptionType,
+          attributeDensity: product.attributeDensity,
+          missingAttributes: product.missingAttributes,
+          backedUpAt: new Date().toISOString(),
+        };
+
+        const updatedAttrs = { ...attrs, _backup: backup };
+
+        await db!
+          .update(products)
+          .set({
+            rewrittenDescription: aiResult.rewrittenDescription,
+            suggestedFaq: aiResult.suggestedFaq as Record<string, unknown>[],
+            generatedSchema: aiResult.generatedSchema,
+            missingAttributes: aiResult.missingAttributes,
+            aeoScore: aiResult.aeoScore,
+            descriptionType: aiResult.descriptionType,
+            attributeDensity: aiResult.attributeDensity,
+            googleCategory: aiResult.googleCategory,
+            extractedAttributes: updatedAttrs,
+          })
+          .where(eq(products.id, pid));
+      } catch (err) {
+        console.error(`[fix-all] Failed to fix product ${pid}:`, err);
+      }
+    }
+    console.log(`[fix-all] Bulk fix complete for ${productIds.length} products in store ${store.id}`);
+  })().catch((err) => console.error("[fix-all] Background process error:", err));
+
+  return c.json({
+    success: true,
+    data: { productCount: productIds.length },
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  GET /setup  — Setup guide page                                    */
+/* ------------------------------------------------------------------ */
+
+appRoute.get("/setup", async (c) => {
+  const store = c.get("shopifyStore");
+  const apiKey = env.SHOPIFY_API_KEY ?? "";
+  const shopDomain = store.shopifyShop ?? store.url ?? "unknown";
+  const shopName = shopDomain.replace(/\.myshopify\.com$/, "");
+
+  const themeEditorUrl = `https://admin.shopify.com/store/${escapeHtml(shopName)}/themes/current/editor?context=apps`;
+  const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}`;
+  const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}`;
+  const llmsTxtUrl = `https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}`;
+
+  const content = `
+    <div class="card">
+      <h2 class="card-title">Setup Guide</h2>
+      <p style="color: #6b7280; font-size: 14px; margin: 0 0 20px;">Follow these steps to maximize your store's AI discoverability.</p>
+
+      <div class="step-card">
+        <div style="display: flex; align-items: center;">
+          <span class="step-number">1</span>
+          <span class="step-title">Enable Schema Injection</span>
+        </div>
+        <div class="step-desc">
+          Go to your Shopify Theme Editor, then navigate to <strong>Theme Settings &rarr; App Embeds</strong> and enable the <strong>FindAble Schema</strong> block.
+          This injects optimized JSON-LD structured data into every product page.
+          <br /><br />
+          <a href="${themeEditorUrl}" target="_blank" class="btn btn-primary" style="font-size: 13px; padding: 8px 16px;">Open Theme Editor &rarr;</a>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div style="display: flex; align-items: center;">
+          <span class="step-number">2</span>
+          <span class="step-title">Submit ACP Feed to ChatGPT</span>
+        </div>
+        <div class="step-desc">
+          Submit your product feed to ChatGPT's merchant program so your products appear in AI shopping recommendations.
+          <div class="code-block">${escapeHtml(acpFeedUrl)}</div>
+          <br />
+          <a href="https://chatgpt.com/merchants" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Go to ChatGPT Merchants &rarr;</a>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div style="display: flex; align-items: center;">
+          <span class="step-number">3</span>
+          <span class="step-title">Submit GMC Feed to Google</span>
+        </div>
+        <div class="step-desc">
+          Add this as a <strong>supplemental feed</strong> in Google Merchant Center to enrich your product data with FindAble's optimized attributes.
+          <div class="code-block">${escapeHtml(gmcFeedUrl)}</div>
+          <br />
+          <a href="https://merchants.google.com/" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Open Google Merchant Center &rarr;</a>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div style="display: flex; align-items: center;">
+          <span class="step-number">4</span>
+          <span class="step-title">Verify Schema</span>
+        </div>
+        <div class="step-desc">
+          Visit any product page on your store and check the page source for <code>&lt;script type="application/ld+json"&gt;</code> blocks.
+          You can also use Google's Rich Results Test to validate your structured data.
+          <br /><br />
+          <a href="https://search.google.com/test/rich-results" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Google Rich Results Test &rarr;</a>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div style="display: flex; align-items: center;">
+          <span class="step-number">5</span>
+          <span class="step-title">llms.txt</span>
+        </div>
+        <div class="step-desc">
+          Your <code>llms.txt</code> file tells AI agents what your store offers. Add a link to it from your homepage or navigation footer.
+          <div class="code-block">${escapeHtml(llmsTxtUrl)}</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  return c.html(renderPage("Setup", content, apiKey));
 });
 
 export { appRoute };
