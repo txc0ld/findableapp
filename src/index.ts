@@ -8,6 +8,7 @@ import { healthRoute } from "./routes/health";
 import { scanRoute } from "./routes/scan";
 import { schemaApiRoute } from "./routes/schema-api";
 import { appRoute } from "./routes/app";
+import { proxyRoute } from "./routes/proxy";
 import { shopifyRoute } from "./routes/shopify";
 import { shopifyBillingRoute } from "./routes/shopify-billing";
 import { storeOpsRoute } from "./routes/store-ops";
@@ -57,6 +58,7 @@ app.route("/api/schema", schemaApiRoute);
 app.route("/api/shopify", shopifyRoute);
 app.route("/api/shopify/billing", shopifyBillingRoute);
 app.route("/api/shopify/store", storeOpsRoute);
+app.route("/api/proxy", proxyRoute);
 app.route("/app", appRoute);
 app.route("/shopify", shopifyRoute);
 

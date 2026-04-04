@@ -223,9 +223,9 @@ The `shopify.app.toml` in the project root defines the app's configuration. Here
 
 ```toml
 name = "FindAble"                                      # App name
-client_id = ""                                         # From Partners dashboard
-application_url = "https://api.getfindable.au/shopify" # Entry point
-embedded = false                                       # Not an embedded app
+client_id = "c010253ca5cf76889ab73e474f0d686e"          # From Partners dashboard
+application_url = "https://api.getfindable.au/app"     # Embedded app entry point
+embedded = true                                        # Embedded in Shopify admin
 
 [access_scopes]
 scopes = "read_products,write_script_tags,read_script_tags,read_themes,read_locales"
