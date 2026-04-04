@@ -165,6 +165,32 @@ export interface ShopInfoResponse {
   };
 }
 
+/** Shop policies — shipping, refund, privacy, terms */
+export const SHOP_POLICIES_QUERY = `
+  query ShopPolicies {
+    shop {
+      shippingPolicy { url body }
+      refundPolicy { url body }
+      privacyPolicy { url body }
+      termsOfService { url body }
+    }
+  }
+`;
+
+export interface ShopPolicy {
+  url: string | null;
+  body: string | null;
+}
+
+export interface ShopPoliciesResponse {
+  shop: {
+    shippingPolicy: ShopPolicy | null;
+    refundPolicy: ShopPolicy | null;
+    privacyPolicy: ShopPolicy | null;
+    termsOfService: ShopPolicy | null;
+  };
+}
+
 /** Bulk operation mutation — for stores with 1000+ products */
 export const BULK_PRODUCTS_QUERY = `
   mutation BulkProducts {

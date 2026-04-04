@@ -7,7 +7,7 @@ import type { ShopifySessionVariables } from "../lib/shopify-session";
 import { verifyShopifySessionToken } from "../lib/shopify-session";
 import { encryptShopifyAccessToken } from "../lib/shopify";
 import { decryptAccessToken } from "../lib/shopify-client";
-import { syncAllProducts, getProductCount, getShopInfo } from "../services/product-sync";
+import { syncAllProducts, getProductCount, getShopInfo, buildStoreConfig, policyFlags } from "../services/product-sync";
 import { startBulkProductSync } from "../services/bulk-operations";
 import { installScriptTag } from "../services/script-tags";
 import { testLlmVisibility } from "../services/llm-tester";
@@ -2125,18 +2125,26 @@ appRoute.post("/products/:id/fix", async (c) => {
 
   const updatedAttrs = { ...attrs, _backup: backup };
 
+  // Build StoreConfig with live policy data to determine shipping/return coverage
+  const storeConfig = await buildStoreConfig(store);
+  const policies = policyFlags(storeConfig);
+
   // Update boolean flags based on what was generated
   const hasGeneratedSchema = aiResult.generatedSchema != null;
   const hasGeneratedFaq = Array.isArray(aiResult.suggestedFaq) && aiResult.suggestedFaq.length > 0;
   const descLen = (aiResult.rewrittenDescription ?? product.originalDescription ?? "").length;
+
+  // Determine shipping/return flags — true if store has the policy in Shopify
+  const hasShipping = policies.hasShippingPolicy || product.hasShippingSchema;
+  const hasReturn = policies.hasReturnPolicy || product.hasReturnSchema;
 
   // Re-score with updated flags
   let schemaScore = 18;
   if (hasGeneratedSchema || product.hasJsonld) schemaScore += 12;
   if (product.hasGtin) schemaScore += 10;
   if (product.hasBrand) schemaScore += 8;
-  if (product.hasShippingSchema) schemaScore += 7;
-  if (product.hasReturnSchema) schemaScore += 7;
+  if (hasShipping) schemaScore += 7;
+  if (hasReturn) schemaScore += 7;
   if (product.hasReviewSchema) schemaScore += 6;
   if (hasGeneratedFaq || product.hasFaqSchema) schemaScore += 4;
   if (product.hasVariantsStructured) schemaScore += 4;
@@ -2171,6 +2179,8 @@ appRoute.post("/products/:id/fix", async (c) => {
       // Updated flags
       hasJsonld: hasGeneratedSchema || product.hasJsonld,
       hasFaqSchema: hasGeneratedFaq || product.hasFaqSchema,
+      hasShippingSchema: hasShipping,
+      hasReturnSchema: hasReturn,
       // Updated scores
       schemaScore,
       llmScore: finalLlmScore,
@@ -2261,6 +2271,10 @@ appRoute.post("/fix-all", async (c) => {
   // Process in background — return immediately
   const productIds = storeProducts.map((p) => p.id);
 
+  // Build StoreConfig once for the whole batch (policies are store-level)
+  const storeConfig = await buildStoreConfig(store);
+  const policies = policyFlags(storeConfig);
+
   // Fire-and-forget background processing
   (async () => {
     for (const pid of productIds) {
@@ -2320,6 +2334,8 @@ appRoute.post("/fix-all", async (c) => {
             attributeDensity: aiResult.attributeDensity,
             googleCategory: aiResult.googleCategory,
             extractedAttributes: updatedAttrs,
+            hasShippingSchema: policies.hasShippingPolicy || product.hasShippingSchema,
+            hasReturnSchema: policies.hasReturnPolicy || product.hasReturnSchema,
           })
           .where(eq(products.id, pid));
       } catch (err) {

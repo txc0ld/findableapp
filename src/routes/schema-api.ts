@@ -5,8 +5,8 @@ import { z } from "zod";
 import { db } from "../db/client";
 import { products, stores } from "../db/schema";
 import { generateAllSchemas } from "../services/schema-generator";
-import type { StoreConfig } from "../services/schema-generator";
 import { validateAllSchemas } from "../services/schema-validator";
+import { buildStoreConfig } from "../services/product-sync";
 import type { MappedProduct } from "../types/shopify";
 
 const QuerySchema = z
@@ -72,13 +72,8 @@ schemaApiRoute.get("/product", async (c) => {
     return c.json({ schemas: null }, 404);
   }
 
-  // Build StoreConfig
-  const storeConfig: StoreConfig = {
-    storeName: store.name ?? shop,
-    storeUrl: store.url,
-    currency: "USD",
-    country: "US",
-  };
+  // Build StoreConfig with live Shopify policy data
+  const storeConfig = await buildStoreConfig(store);
 
   // Build MappedProduct from the DB record
   const attrs = (product.extractedAttributes ?? {}) as Record<string, unknown>;

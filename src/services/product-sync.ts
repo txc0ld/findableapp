@@ -17,13 +17,17 @@ import { eq, and } from "drizzle-orm";
 
 import { db } from "../db/client";
 import { products, stores } from "../db/schema";
-import { shopifyGql } from "../lib/shopify-client";
+import { shopifyGql, decryptAccessToken } from "../lib/shopify-client";
+import type { StoreConfig } from "./schema-generator";
+import type { Store } from "../db/schema";
 import {
   PRODUCTS_QUERY,
   PRODUCT_BY_ID_QUERY,
   PRODUCT_COUNT_QUERY,
   SHOP_QUERY,
+  SHOP_POLICIES_QUERY,
   type ShopInfoResponse,
+  type ShopPoliciesResponse,
 } from "../graphql/products";
 import type {
   ShopifyProduct,
@@ -272,4 +276,80 @@ export async function syncSingleProduct(
   await upsertProduct(storeId, mapped);
 
   return mapped;
+}
+
+/** Fetch store-level policies (shipping, refund, privacy, ToS) from Shopify */
+export async function fetchShopPolicies(
+  shop: string,
+  accessToken: string,
+): Promise<ShopPoliciesResponse["shop"]> {
+  const data = await shopifyGql<ShopPoliciesResponse>(shop, accessToken, SHOP_POLICIES_QUERY);
+  return data.shop;
+}
+
+/**
+ * Build a complete StoreConfig from a store record + live Shopify policies.
+ *
+ * Fetches policies from Shopify on the fly so no DB migration is needed.
+ * Falls back gracefully if the API call fails.
+ */
+export async function buildStoreConfig(store: Store): Promise<StoreConfig> {
+  const config: StoreConfig = {
+    storeName: store.name ?? store.shopifyShop ?? "Store",
+    storeUrl: store.url,
+    currency: "AUD",
+    country: "AU",
+  };
+
+  if (store.shopifyShop && store.shopifyAccessToken) {
+    try {
+      const accessToken = decryptAccessToken(store.shopifyAccessToken);
+
+      // Fetch shop info for accurate currency/country
+      try {
+        const shopInfo = await getShopInfo(store.shopifyShop, accessToken);
+        config.currency = shopInfo.currencyCode || "AUD";
+        config.country = shopInfo.country || "AU";
+      } catch (err) {
+        console.error("[buildStoreConfig] Failed to fetch shop info:", err);
+      }
+
+      // Fetch policies from Shopify
+      const policies = await fetchShopPolicies(store.shopifyShop, accessToken);
+
+      if (policies.refundPolicy?.url) {
+        config.returnPolicyUrl = policies.refundPolicy.url;
+        // Parse return days from policy body if possible
+        const daysMatch = policies.refundPolicy.body?.match(/(\d+)\s*days?/i);
+        if (daysMatch) config.returnDays = parseInt(daysMatch[1]!, 10);
+        else config.returnDays = 30; // reasonable default when policy exists but days not parseable
+        config.returnMethod = "ReturnByMail";
+      }
+
+      if (policies.shippingPolicy?.url) {
+        // Default shipping estimates for AU stores
+        config.shippingRate = "0";
+        config.shippingMinDays = 3;
+        config.shippingMaxDays = 10;
+      }
+    } catch (err) {
+      console.error("[buildStoreConfig] Failed to fetch policies:", err);
+    }
+  }
+
+  return config;
+}
+
+/**
+ * Check whether the store has shipping/return policies configured in Shopify.
+ * Returns flags that can be used to update product records after auto-fix.
+ */
+export function policyFlags(config: StoreConfig): {
+  hasShippingPolicy: boolean;
+  hasReturnPolicy: boolean;
+} {
+  return {
+    hasShippingPolicy: config.shippingRate !== undefined,
+    hasReturnPolicy: config.returnDays !== undefined,
+  };
 }
