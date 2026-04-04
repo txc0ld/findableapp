@@ -6,6 +6,7 @@ import { db } from "../db/client";
 import { products, stores } from "../db/schema";
 import { generateAllSchemas } from "../services/schema-generator";
 import type { StoreConfig } from "../services/schema-generator";
+import { validateAllSchemas } from "../services/schema-validator";
 import type { MappedProduct } from "../types/shopify";
 
 const QuerySchema = z
@@ -117,7 +118,13 @@ schemaApiRoute.get("/product", async (c) => {
 
   const schemas = generateAllSchemas(mapped, storeConfig, faqs ?? undefined);
 
+  const validation = validateAllSchemas(schemas, {
+    price: mapped.price ?? undefined,
+    availability: mapped.availability,
+    name: mapped.name,
+  });
+
   c.header("Cache-Control", "public, max-age=300, s-maxage=300");
   c.header("Access-Control-Allow-Origin", "*");
-  return c.json({ schemas });
+  return c.json({ schemas, validation });
 });
