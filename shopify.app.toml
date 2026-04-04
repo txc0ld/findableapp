@@ -40,8 +40,5 @@ url = "https://api.getfindable.au/proxy/findable"
 subpath = "findable"
 prefix = "apps"
 
-[privacy]
-privacy_policy_url = "https://getfindable.au/privacy"
-
 [pos]
 embedded = false
