@@ -879,6 +879,35 @@ appRoute.get("/settings", async (c) => {
     </div>
 
     <div class="card">
+      <h2 class="card-title">Product Feeds</h2>
+      <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px;">Submit these URLs to Google Merchant Center and ChatGPT to power AI-driven product discovery.</p>
+      <div class="stat-row">
+        <span class="stat-label">ACP Feed (ChatGPT)</span>
+        <span class="stat-value" style="font-size: 12px; word-break: break-all;">
+          <a href="https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}" target="_blank" style="color: #2563eb;">
+            https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}
+          </a>
+        </span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">GMC Feed (Google)</span>
+        <span class="stat-value" style="font-size: 12px; word-break: break-all;">
+          <a href="https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}" target="_blank" style="color: #2563eb;">
+            https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}
+          </a>
+        </span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">llms.txt</span>
+        <span class="stat-value" style="font-size: 12px; word-break: break-all;">
+          <a href="https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}" target="_blank" style="color: #2563eb;">
+            https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}
+          </a>
+        </span>
+      </div>
+    </div>
+
+    <div class="card">
       <h2 class="card-title">Full Dashboard</h2>
       <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px;">Access advanced analytics, competitor tracking, feed generation, and more.</p>
       <a class="btn btn-secondary" href="${escapeHtml(frontendUrl)}/dashboard" target="_top">Open Full Dashboard</a>

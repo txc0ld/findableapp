@@ -12,6 +12,7 @@ import { proxyRoute } from "./routes/proxy";
 import { shopifyRoute } from "./routes/shopify";
 import { shopifyBillingRoute } from "./routes/shopify-billing";
 import { storeOpsRoute } from "./routes/store-ops";
+import { feedsRoute } from "./routes/feeds";
 
 const app = new Hono();
 const allowedOrigins = (
@@ -61,6 +62,7 @@ app.route("/api/shopify/store", storeOpsRoute);
 app.route("/api/proxy", proxyRoute);
 app.route("/proxy/findable", proxyRoute);
 app.route("/app", appRoute);
+app.route("/feeds", feedsRoute);
 app.route("/shopify", shopifyRoute);
 
 export type AppType = typeof app;
