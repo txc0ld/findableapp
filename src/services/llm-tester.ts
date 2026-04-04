@@ -149,53 +149,47 @@ export async function testLlmVisibility(params: {
 
   const client = new OpenAI({ apiKey: env.OPENAI_API_KEY });
   const prompts = buildTestPrompts(productCategory, useCases);
-  const results: VisibilityTestResult[] = [];
 
-  for (const prompt of prompts) {
-    try {
-      const response = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a helpful shopping assistant. Recommend specific brands and products. Be detailed and mention real brand names in your recommendations.",
-          },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.7,
-        max_tokens: 1000,
-      });
+  // Run all prompts in parallel to stay within proxy timeout
+  const results = await Promise.all(
+    prompts.map(async (prompt): Promise<VisibilityTestResult> => {
+      try {
+        const response = await client.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a helpful shopping assistant. Recommend specific brands and products. Be detailed and mention real brand names in your recommendations.",
+            },
+            { role: "user", content: prompt },
+          ],
+          temperature: 0.7,
+          max_tokens: 500,
+        });
 
-      const content = response.choices[0]?.message?.content ?? "";
-      const lowerContent = content.toLowerCase();
-      const mentioned = lowerContent.includes(brandName.toLowerCase());
-      const mentionContext = mentioned
-        ? extractMentionContext(content, brandName)
-        : null;
-      const competitorsMentioned = detectCompetitors(content, brandName);
+        const content = response.choices[0]?.message?.content ?? "";
+        const mentioned = content.toLowerCase().includes(brandName.toLowerCase());
 
-      results.push({
-        prompt,
-        mentioned,
-        mentionContext,
-        competitorsMentioned,
-        timestamp: new Date(),
-      });
-    } catch (err) {
-      console.error(
-        `[llm-tester] Error testing prompt "${prompt}":`,
-        err,
-      );
-      results.push({
-        prompt,
-        mentioned: false,
-        mentionContext: null,
-        competitorsMentioned: [],
-        timestamp: new Date(),
-      });
-    }
-  }
+        return {
+          prompt,
+          mentioned,
+          mentionContext: mentioned ? extractMentionContext(content, brandName) : null,
+          competitorsMentioned: detectCompetitors(content, brandName),
+          timestamp: new Date(),
+        };
+      } catch (err) {
+        console.error(`[llm-tester] Error testing prompt "${prompt}":`, err);
+        return {
+          prompt,
+          mentioned: false,
+          mentionContext: null,
+          competitorsMentioned: [],
+          timestamp: new Date(),
+        };
+      }
+    }),
+  );
 
   const mentionCount = results.filter((r) => r.mentioned).length;
 
