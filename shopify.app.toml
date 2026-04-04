@@ -2,7 +2,7 @@
 # https://shopify.dev/docs/apps/tools/cli/configuration
 
 name = "FindAble"
-client_id = "" # Set from Shopify Partners dashboard
+client_id = "c010253ca5cf76889ab73e474f0d686e"
 application_url = "https://api.getfindable.au/app"
 embedded = true
 
