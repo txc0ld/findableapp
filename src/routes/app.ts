@@ -90,32 +90,18 @@ function renderPage(title: string, content: string, apiKey: string): string {
     </nav>
     ${content}
   </div>
-  <script src="https://unpkg.com/@shopify/app-bridge@4/umd/index.js"></script>
-  <script>
-    var AppBridge = window['app-bridge'];
-    if (AppBridge) {
-      AppBridge.createApp({ apiKey: '${escapeHtml(apiKey)}', host: new URLSearchParams(location.search).get('host') || '' });
-    }
-  </script>
+  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="${escapeHtml(apiKey)}"></script>
+  <script src="/app/assets/app.js"></script>
 </body>
 </html>`;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Embedded-page auth middleware                                     */
-/*                                                                    */
-/*  For the initial page load Shopify sends an `id_token` query param */
-/*  (a JWT signed with our API secret). We verify it and look up the  */
-/*  store record. If no id_token is provided we fall back to the      */
-/*  `shop` query param (basic lookup, no signature check).            */
-/* ------------------------------------------------------------------ */
-
 /**
- * App Bridge bootstrap page — served when we can't authenticate yet.
- * App Bridge handles the OAuth/auth flow inside the Shopify admin iframe,
- * then reloads the page with the proper id_token for token exchange.
+ * Setup page — served when the store doesn't exist yet.
+ * Loads App Bridge (CDN) and our external JS which handles the token
+ * exchange via fetch (App Bridge automatically adds the Authorization header).
  */
-function appBridgeBootstrap(apiKey: string, shop: string): string {
+function setupPage(apiKey: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -130,75 +116,14 @@ function appBridgeBootstrap(apiKey: string, shop: string): string {
     .error { color: #dc2626; display: none; }
   </style>
 </head>
-<body>
+<body data-needs-setup="true">
   <div class="loading">
     <div class="spinner"></div>
     <p id="status">Setting up FindAble...</p>
     <p id="error" class="error"></p>
   </div>
-  <script data-api-key="${escapeHtml(apiKey)}" src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
-  <script>
-    function updateStatus(msg) { document.getElementById('status').textContent = msg; }
-    function showError(msg) {
-      document.getElementById('error').style.display = 'block';
-      document.getElementById('error').textContent = msg;
-      document.getElementById('status').textContent = '';
-      document.querySelector('.spinner').style.display = 'none';
-      console.error('[FindAble]', msg);
-    }
-
-    function waitForShopify(attempts) {
-      if (typeof shopify !== 'undefined' && shopify.idToken) {
-        console.log('[FindAble] App Bridge ready');
-        doSetup();
-      } else if (attempts > 50) {
-        showError('App Bridge failed to load. Please refresh.');
-      } else {
-        setTimeout(function() { waitForShopify(attempts + 1); }, 100);
-      }
-    }
-
-    async function doSetup() {
-      try {
-        updateStatus('Authenticating...');
-
-        // First try: get id_token from URL query params (Shopify sends this on managed install)
-        var params = new URLSearchParams(window.location.search);
-        var token = params.get('id_token');
-        console.log('[FindAble] id_token from URL:', token ? 'present (' + token.length + ' chars)' : 'absent');
-
-        // Fallback: get session token from App Bridge
-        if (!token) {
-          console.log('[FindAble] Getting session token from App Bridge...');
-          token = await Promise.race([
-            shopify.idToken(),
-            new Promise(function(_, reject) { setTimeout(function() { reject(new Error('Token timeout')); }, 5000); })
-          ]);
-          console.log('[FindAble] Got App Bridge token, length:', token ? token.length : 0);
-        }
-
-        updateStatus('Creating your account...');
-        var res = await fetch('/app/auth/setup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: token, shop: '${escapeHtml(shop)}' })
-        });
-        console.log('[FindAble] Setup response:', res.status);
-
-        if (res.ok) {
-          updateStatus('Ready! Reloading...');
-          window.location.reload();
-        } else {
-          var data = await res.json().catch(function() { return {}; });
-          showError(data.error || 'Setup failed (' + res.status + '). Please refresh.');
-        }
-      } catch(e) {
-        showError('Error: ' + e.message);
-      }
-    }
-
-    waitForShopify(0);
-  </script>
+  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="${escapeHtml(apiKey)}"></script>
+  <script src="/app/assets/app.js"></script>
 </body>
 </html>`;
 }
@@ -212,34 +137,188 @@ appRoute.use("*", async (c, next) => {
   c.res.headers.delete("X-Frame-Options");
 });
 
-// Setup endpoint — called by bootstrap page with App Bridge session token
-appRoute.post("/auth/setup", async (c) => {
+/* ------------------------------------------------------------------ */
+/*  External JavaScript — served as /app/assets/app.js                */
+/*                                                                    */
+/*  All client-side logic lives here instead of inline <script> tags  */
+/*  so it executes correctly inside Shopify's admin iframe.           */
+/* ------------------------------------------------------------------ */
+
+const APP_JS = `(function() {
+  'use strict';
+
+  var statusEl = document.getElementById('status');
+  var errorEl = document.getElementById('error');
+  var spinnerEl = document.querySelector('.spinner');
+
+  function showError(msg) {
+    if (errorEl) { errorEl.style.display = 'block'; errorEl.textContent = msg; }
+    if (statusEl) statusEl.textContent = '';
+    if (spinnerEl) spinnerEl.style.display = 'none';
+    console.error('[FindAble]', msg);
+  }
+
+  function updateStatus(msg) {
+    if (statusEl) statusEl.textContent = msg;
+  }
+
+  /* ---- Setup flow (runs when store does not exist yet) ---- */
+
+  async function runSetup() {
+    try {
+      updateStatus('Authenticating...');
+      console.log('[FindAble] Starting setup via /app/api/init');
+
+      // App Bridge automatically adds Authorization: Bearer <session_token>
+      var res = await fetch('/app/api/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      console.log('[FindAble] Init response:', res.status);
+
+      if (res.ok) {
+        var data = await res.json().catch(function() { return {}; });
+        updateStatus('Ready! Loading dashboard...');
+        var shop = data.shop || new URLSearchParams(window.location.search).get('shop') || '';
+        window.location.href = '/app?shop=' + encodeURIComponent(shop);
+      } else {
+        var err = await res.json().catch(function() { return {}; });
+        showError(err.error || 'Setup failed (' + res.status + '). Please refresh.');
+      }
+    } catch(e) {
+      showError('Error: ' + e.message);
+    }
+  }
+
+  /* ---- Dashboard: sync products ---- */
+
+  window.findableSyncProducts = async function() {
+    var btn = document.getElementById('sync-btn');
+    var status = document.getElementById('sync-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Syncing...';
+    status.className = 'loading';
+    status.textContent = 'Starting product sync...';
+
+    try {
+      var res = await fetch('/api/shopify/store/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok) {
+        status.className = 'success';
+        status.textContent = 'Sync started successfully. Products will update shortly.';
+      } else {
+        status.className = 'error';
+        status.textContent = data.error || 'Sync failed. Please try again.';
+      }
+    } catch(e) {
+      status.className = 'error';
+      status.textContent = 'Network error. Please check your connection.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Sync Products';
+  };
+
+  /* ---- Settings: install script tags ---- */
+
+  window.findableInstallScriptTag = async function() {
+    var btn = document.getElementById('install-script-btn');
+    var status = document.getElementById('script-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Installing...';
+    status.style.display = 'block';
+    status.style.background = '#eff6ff';
+    status.style.color = '#2563eb';
+    status.textContent = 'Installing script tags...';
+
+    try {
+      var res = await fetch('/api/shopify/store/script-tags', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok) {
+        status.style.background = '#f0fdf4';
+        status.style.color = '#16a34a';
+        status.textContent = 'Script tags installed successfully.';
+      } else {
+        status.style.background = '#fef2f2';
+        status.style.color = '#dc2626';
+        status.textContent = data.error || 'Installation failed. Please try again.';
+      }
+    } catch(e) {
+      status.style.background = '#fef2f2';
+      status.style.color = '#dc2626';
+      status.textContent = 'Network error. Please check your connection.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Install Script Tags';
+  };
+
+  /* ---- Init ---- */
+
+  if (document.body.dataset.needsSetup === 'true') {
+    // Wait for App Bridge to patch fetch with session token injection
+    function waitForAppBridge(attempts) {
+      if (typeof shopify !== 'undefined') {
+        runSetup();
+      } else if (attempts > 50) {
+        showError('App Bridge failed to load. Please refresh the page.');
+      } else {
+        setTimeout(function() { waitForAppBridge(attempts + 1); }, 100);
+      }
+    }
+    waitForAppBridge(0);
+  }
+})();
+`;
+
+appRoute.get("/assets/app.js", (c) => {
+  c.header("Content-Type", "application/javascript; charset=utf-8");
+  c.header("Cache-Control", "public, max-age=300");
+  return c.body(APP_JS);
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /api/init — server-side token exchange                       */
+/*                                                                    */
+/*  Called by the setup page JS. App Bridge adds the Authorization    */
+/*  header automatically so we get the session token from there.      */
+/* ------------------------------------------------------------------ */
+
+appRoute.post("/api/init", async (c) => {
   if (!db || !env.SHOPIFY_API_KEY || !env.SHOPIFY_API_SECRET) {
     return c.json({ error: "Server not configured" }, 503);
   }
 
-  const body = (await c.req.json().catch(() => ({}))) as { token?: string; shop?: string };
-  const sessionToken = body.token;
-  const shopFromBody = body.shop?.replace(/^https?:\/\//, "");
+  // Get session token from Authorization header (added by App Bridge)
+  const authorization = c.req.header("authorization");
+  const sessionToken = authorization?.startsWith("Bearer ")
+    ? authorization.slice(7).trim()
+    : null;
 
   if (!sessionToken) {
-    return c.json({ error: "Missing session token" }, 400);
+    return c.json({ error: "No session token. Please reload the page." }, 401);
   }
 
-  // Verify the session token to get the shop domain
-  let shopDomain: string | null = null;
+  // Verify the session token
+  let shopDomain: string;
   try {
     const result = await verifyShopifySessionToken(sessionToken);
     shopDomain = result.shop;
-    console.log(`[app/setup] Token verified for: ${shopDomain}`);
+    console.log(`[app/api/init] Token verified for: ${shopDomain}`);
   } catch (err) {
-    console.error("[app/setup] Token verification failed:", err);
-    // Fall back to shop from body if token verification fails
-    shopDomain = shopFromBody ?? null;
-  }
-
-  if (!shopDomain) {
-    return c.json({ error: "Could not determine shop" }, 400);
+    console.error("[app/api/init] Token verification failed:", err);
+    return c.json({ error: "Invalid session token" }, 401);
   }
 
   // Check if store already exists
@@ -247,12 +326,12 @@ appRoute.post("/auth/setup", async (c) => {
     where: eq(stores.shopifyShop, shopDomain),
   });
   if (existing) {
-    console.log(`[app/setup] Store already exists: ${existing.id}`);
-    return c.json({ success: true, storeId: existing.id });
+    console.log(`[app/api/init] Store already exists: ${existing.id}`);
+    return c.json({ success: true, storeId: existing.id, shop: shopDomain });
   }
 
   // Exchange session token for offline access token
-  console.log(`[app/setup] Exchanging token for ${shopDomain}...`);
+  console.log(`[app/api/init] Exchanging token for ${shopDomain}...`);
   const tokenExchangeResponse = await fetch(
     `https://${shopDomain}/admin/oauth/access_token`,
     {
@@ -271,7 +350,7 @@ appRoute.post("/auth/setup", async (c) => {
 
   if (!tokenExchangeResponse.ok) {
     const errText = await tokenExchangeResponse.text();
-    console.error(`[app/setup] Token exchange failed: ${tokenExchangeResponse.status} ${errText}`);
+    console.error(`[app/api/init] Token exchange failed: ${tokenExchangeResponse.status} ${errText}`);
     return c.json({ error: "Token exchange failed" }, 502);
   }
 
@@ -279,7 +358,7 @@ appRoute.post("/auth/setup", async (c) => {
     access_token: string;
     scope?: string;
   };
-  console.log(`[app/setup] Got access token for ${shopDomain}`);
+  console.log(`[app/api/init] Got access token for ${shopDomain}`);
 
   // Fetch shop info
   const shopResponse = await fetch(
@@ -320,134 +399,88 @@ appRoute.post("/auth/setup", async (c) => {
   }).returning();
 
   const store = inserted[0];
-  console.log(`[app/setup] Store created: ${store?.id} for ${shopDomain}`);
+  console.log(`[app/api/init] Store created: ${store?.id} for ${shopDomain}`);
 
-  return c.json({ success: true, storeId: store?.id });
+  return c.json({ success: true, storeId: store?.id, shop: shopDomain });
 });
 
-// Auth middleware
+/* ------------------------------------------------------------------ */
+/*  Auth middleware for HTML pages                                    */
+/*                                                                    */
+/*  Skips /assets/ and /api/ routes (those have their own auth).      */
+/*  Checks Authorization header, id_token query param, then shop      */
+/*  query param. If a store exists, continue; otherwise serve the     */
+/*  setup page which triggers /api/init via App Bridge.               */
+/* ------------------------------------------------------------------ */
+
 appRoute.use("*", async (c, next) => {
-  if (!db) {
-    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? "", c.req.query("shop") ?? ""), 200);
+  const pathname = new URL(c.req.url).pathname;
+
+  // Assets and API routes handle their own auth
+  if (pathname.startsWith("/app/assets/") || pathname.startsWith("/app/api/")) {
+    return next();
   }
 
-  const idToken = c.req.query("id_token");
-  const shopParam = c.req.query("shop");
-
-  console.log(`[app] Request: id_token=${idToken ? "present" : "absent"}, shop=${shopParam ?? "absent"}`);
+  if (!db) {
+    return c.html(setupPage(env.SHOPIFY_API_KEY ?? ""), 200);
+  }
 
   let shopDomain: string | null = null;
 
-  // Prefer verifying the signed id_token from Shopify
-  if (idToken) {
+  // 1. Check Authorization header (App Bridge adds this to fetch calls)
+  const authorization = c.req.header("authorization");
+  const bearerToken = authorization?.startsWith("Bearer ")
+    ? authorization.slice(7).trim()
+    : null;
+  if (bearerToken) {
     try {
-      const result = await verifyShopifySessionToken(idToken);
+      const result = await verifyShopifySessionToken(bearerToken);
       shopDomain = result.shop;
-      console.log(`[app] Token verified for shop: ${shopDomain}`);
-    } catch (err) {
-      console.error("[app] Token verification failed:", err);
+      console.log(`[app] Auth header verified for shop: ${shopDomain}`);
+    } catch {
+      // Token invalid — continue to next check
     }
   }
 
-  // Fallback: use shop query param
-  if (!shopDomain && shopParam) {
-    shopDomain = shopParam.replace(/^https?:\/\//, "");
-    console.log(`[app] Using shop param: ${shopDomain}`);
+  // 2. Check id_token query param (Shopify managed install)
+  if (!shopDomain) {
+    const idToken = c.req.query("id_token");
+    if (idToken) {
+      try {
+        const result = await verifyShopifySessionToken(idToken);
+        shopDomain = result.shop;
+        console.log(`[app] id_token verified for shop: ${shopDomain}`);
+      } catch {
+        // Token invalid — continue to next check
+      }
+    }
+  }
+
+  // 3. Fallback: shop query param (basic lookup, no signature check)
+  if (!shopDomain) {
+    const shopParam = c.req.query("shop");
+    if (shopParam) {
+      shopDomain = shopParam.replace(/^https?:\/\//, "");
+      console.log(`[app] Using shop param: ${shopDomain}`);
+    }
   }
 
   if (!shopDomain) {
-    console.log("[app] No shop domain — serving bootstrap");
-    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? "", c.req.query("shop") ?? ""), 200);
+    console.log("[app] No shop domain — serving setup page");
+    return c.html(setupPage(env.SHOPIFY_API_KEY ?? ""), 200);
   }
 
-  let store = await db.query.stores.findFirst({
+  // Look up existing store
+  const store = await db.query.stores.findFirst({
     where: eq(stores.shopifyShop, shopDomain),
   });
 
-  // First-time install: store doesn't exist yet. Exchange session token for
-  // an offline access token and create the store + account records.
-  if (!store && idToken && env.SHOPIFY_API_KEY && env.SHOPIFY_API_SECRET) {
-    try {
-      const tokenExchangeResponse = await fetch(
-        `https://${shopDomain}/admin/oauth/access_token`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            client_id: env.SHOPIFY_API_KEY,
-            client_secret: env.SHOPIFY_API_SECRET,
-            grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-            subject_token: idToken,
-            subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-            requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
-          }),
-        },
-      );
-
-      console.log(`[app] Token exchange response: ${tokenExchangeResponse.status}`);
-      if (!tokenExchangeResponse.ok) {
-        const errText = await tokenExchangeResponse.text();
-        console.error(`[app] Token exchange failed: ${tokenExchangeResponse.status} ${errText}`);
-      }
-      if (tokenExchangeResponse.ok) {
-        const tokenData = (await tokenExchangeResponse.json()) as {
-          access_token: string;
-          scope?: string;
-        };
-
-        // Fetch shop info
-        const shopResponse = await fetch(
-          `https://${shopDomain}/admin/api/${env.SHOPIFY_API_VERSION}/shop.json`,
-          { headers: { "x-shopify-access-token": tokenData.access_token } },
-        );
-        const shopData = shopResponse.ok
-          ? ((await shopResponse.json()) as { shop: { name: string; email: string; domain?: string; primary_domain?: { url?: string } } }).shop
-          : null;
-
-        const email = shopData?.email ?? `${shopDomain}@shop.findable`;
-        const primaryUrl = shopData?.primary_domain?.url
-          ?? (shopData?.domain ? `https://${shopData.domain}` : `https://${shopDomain}`);
-
-        // Find or create account by email
-        let account = await db.query.accounts.findFirst({
-          where: eq(accounts.email, email.trim().toLowerCase()),
-        });
-        if (!account) {
-          const inserted = await db.insert(accounts).values({
-            email: email.trim().toLowerCase(),
-          }).returning();
-          account = inserted[0];
-        }
-
-        // Create store
-        const encryptedToken = encryptShopifyAccessToken(tokenData.access_token);
-        const inserted = await db.insert(stores).values({
-          accountId: account?.id,
-          name: shopData?.name ?? shopDomain,
-          url: primaryUrl,
-          platform: "shopify",
-          shopifyShop: shopDomain,
-          shopifyAccessToken: encryptedToken,
-          shopifyScopes: (tokenData.scope ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-          shopifyInstalledAt: new Date(),
-          productCount: 0,
-        }).returning();
-
-        store = inserted[0];
-        console.log(`[app] Store created: ${store?.id} for ${shopDomain}`);
-      }
-    } catch (e) {
-      console.error("[app] Token exchange error:", e);
-    }
-  }
-
   if (!store) {
-    console.log(`[app] No store for ${shopDomain} — serving bootstrap`);
-    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? "", c.req.query("shop") ?? ""), 200);
+    console.log(`[app] No store for ${shopDomain} — serving setup page`);
+    return c.html(setupPage(env.SHOPIFY_API_KEY ?? ""), 200);
   }
 
   console.log(`[app] Authenticated: store=${store.id}, shop=${shopDomain}`);
-
   c.set("shopifyStore", store);
   c.set("shopifyShop", shopDomain);
   await next();
@@ -566,7 +599,7 @@ appRoute.get("/", async (c) => {
         <span class="stat-value">${escapeHtml(lastSyncTime)}</span>
       </div>
       <div class="actions">
-        <button class="btn btn-primary" id="sync-btn" onclick="syncProducts()">Sync Products</button>
+        <button class="btn btn-primary" id="sync-btn" onclick="findableSyncProducts()">Sync Products</button>
         <a class="btn btn-secondary" href="${escapeHtml(frontendUrl)}/dashboard" target="_top">Open Full Dashboard</a>
       </div>
       <div id="sync-status"></div>
@@ -577,50 +610,6 @@ appRoute.get("/", async (c) => {
       ${issuesHtml}
     </div>
 
-    <script>
-      async function syncProducts() {
-        var btn = document.getElementById('sync-btn');
-        var status = document.getElementById('sync-status');
-        btn.disabled = true;
-        btn.textContent = 'Syncing...';
-        status.className = 'loading';
-        status.textContent = 'Starting product sync...';
-
-        try {
-          var res = await fetch('/api/shopify/store/sync', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer ' + (await getSessionToken())
-            }
-          });
-          var data = await res.json();
-          if (res.ok) {
-            status.className = 'success';
-            status.textContent = 'Sync started successfully. Products will update shortly.';
-          } else {
-            status.className = 'error';
-            status.textContent = data.error || 'Sync failed. Please try again.';
-          }
-        } catch (e) {
-          status.className = 'error';
-          status.textContent = 'Network error. Please check your connection.';
-        }
-
-        btn.disabled = false;
-        btn.textContent = 'Sync Products';
-      }
-
-      async function getSessionToken() {
-        try {
-          var AppBridge = window['app-bridge'];
-          if (AppBridge && AppBridge.getSessionToken) {
-            return await AppBridge.getSessionToken();
-          }
-        } catch (e) {}
-        return '';
-      }
-    </script>
   `;
 
   return c.html(renderPage("Dashboard", content, apiKey));
@@ -773,7 +762,7 @@ appRoute.get("/settings", async (c) => {
         <span class="stat-value">${hasScriptTag ? '<span style="color: #16a34a;">Installed</span>' : '<span style="color: #dc2626;">Not installed</span>'}</span>
       </div>
       <div class="actions">
-        <button class="btn btn-primary" id="install-script-btn" onclick="installScriptTag()">Install Script Tags</button>
+        <button class="btn btn-primary" id="install-script-btn" onclick="findableInstallScriptTag()">Install Script Tags</button>
       </div>
       <div id="script-status" style="display: none; margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 13px;"></div>
     </div>
@@ -804,55 +793,6 @@ appRoute.get("/settings", async (c) => {
       <a class="btn btn-secondary" href="${escapeHtml(frontendUrl)}/dashboard" target="_top">Open Full Dashboard</a>
     </div>
 
-    <script>
-      async function installScriptTag() {
-        var btn = document.getElementById('install-script-btn');
-        var status = document.getElementById('script-status');
-        btn.disabled = true;
-        btn.textContent = 'Installing...';
-        status.style.display = 'block';
-        status.style.background = '#eff6ff';
-        status.style.color = '#2563eb';
-        status.textContent = 'Installing script tags...';
-
-        try {
-          var res = await fetch('/api/shopify/store/script-tags', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer ' + (await getSessionToken())
-            }
-          });
-          var data = await res.json();
-          if (res.ok) {
-            status.style.background = '#f0fdf4';
-            status.style.color = '#16a34a';
-            status.textContent = 'Script tags installed successfully.';
-          } else {
-            status.style.background = '#fef2f2';
-            status.style.color = '#dc2626';
-            status.textContent = data.error || 'Installation failed. Please try again.';
-          }
-        } catch (e) {
-          status.style.background = '#fef2f2';
-          status.style.color = '#dc2626';
-          status.textContent = 'Network error. Please check your connection.';
-        }
-
-        btn.disabled = false;
-        btn.textContent = 'Install Script Tags';
-      }
-
-      async function getSessionToken() {
-        try {
-          var AppBridge = window['app-bridge'];
-          if (AppBridge && AppBridge.getSessionToken) {
-            return await AppBridge.getSessionToken();
-          }
-        } catch (e) {}
-        return '';
-      }
-    </script>
   `;
 
   return c.html(renderPage("Settings", content, apiKey));
