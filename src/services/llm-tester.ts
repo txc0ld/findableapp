@@ -127,8 +127,10 @@ function buildTestPrompts(
   productCategory: string,
   useCases: string[],
 ): string[] {
-  return useCases.map(
-    (useCase) => `What are the best ${productCategory} for ${useCase}?`,
+  return useCases.map((useCase) =>
+    useCase.startsWith("__RAW__")
+      ? useCase.slice(7)
+      : `What are the best ${productCategory} for ${useCase}?`,
   );
 }
 

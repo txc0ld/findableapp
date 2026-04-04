@@ -1162,29 +1162,53 @@ appRoute.post("/visibility-test", async (c) => {
     try {
       let brandName = store.name ?? store.shopifyShop?.replace(".myshopify.com", "") ?? "Unknown";
 
-      const firstProduct = await db!
-        .select({ extractedAttributes: products.extractedAttributes, googleCategory: products.googleCategory })
+      const storeProducts = await db!
+        .select({
+          extractedAttributes: products.extractedAttributes,
+          googleCategory: products.googleCategory,
+          price: products.price,
+        })
         .from(products)
         .where(eq(products.storeId, store.id))
-        .limit(5);
+        .limit(20);
 
-      const firstAttrs = firstProduct[0]?.extractedAttributes as Record<string, unknown> | null;
+      const firstAttrs = storeProducts[0]?.extractedAttributes as Record<string, unknown> | null;
       if (firstAttrs?.vendor && typeof firstAttrs.vendor === "string" && firstAttrs.vendor.length > 0) {
         brandName = firstAttrs.vendor;
       }
 
       const categorySet = new Set<string>();
-      for (const p of firstProduct) {
+      for (const p of storeProducts) {
         const attrs = p.extractedAttributes as Record<string, unknown> | null;
         if (attrs?.productType && typeof attrs.productType === "string") categorySet.add(attrs.productType);
         if (p.googleCategory) categorySet.add(p.googleCategory);
       }
       const productCategory = categorySet.size > 0 ? Array.from(categorySet)[0]! : "products";
 
+      // Get average price for price-constrained prompt
+      const prices = storeProducts
+        .map((p) => parseFloat(p.price ?? "0"))
+        .filter((p) => p > 0);
+      const avgPrice = prices.length > 0
+        ? Math.round(prices.reduce((a, b) => a + b, 0) / prices.length * 1.5)
+        : 100;
+
+      // Research-backed prompts:
+      // - "best [product]" triggers 83% of AI Overviews
+      // - Brand discovery tests 0.334 correlation factor
+      // - Price-constrained is most common real shopping query
+      // - "recommend" mirrors how people talk to LLMs
+      // - "buy right now" tests freshness signal (3.2x citation boost for recent content)
       const report = await testLlmVisibility({
         brandName,
         productCategory,
-        useCases: ["everyday use", "beginners", "professionals", "value for money", "sustainability"],
+        useCases: [
+          `__RAW__What are the best ${productCategory}?`,
+          `__RAW__Best ${productCategory} to buy right now`,
+          `__RAW__What ${productCategory} do you recommend?`,
+          `__RAW__I need a ${productCategory}, what brands should I consider?`,
+          `__RAW__Best ${productCategory} under $${avgPrice}`,
+        ],
       });
 
       visibilityResults.set(store.id, { status: "complete", data: report });
