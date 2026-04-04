@@ -1,0 +1,5 @@
+# FindAble Schema Injection — Theme App Extension
+# https://shopify.dev/docs/apps/build/online-store/theme-app-extensions
+
+type = "theme"
+name = "FindAble Schema"

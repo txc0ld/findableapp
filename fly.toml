@@ -1,0 +1,23 @@
+app = "findable-api"
+primary_region = "syd"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3001"
+  JWT_ISSUER = "findable-api"
+  FRONTEND_URL = "https://getfindable.au"
+  CORS_ORIGINS = "https://getfindable.au,https://www.getfindable.au"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

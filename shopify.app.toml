@@ -1,0 +1,43 @@
+# FindAble Shopify App Configuration
+# https://shopify.dev/docs/apps/tools/cli/configuration
+
+name = "FindAble"
+client_id = "" # Set from Shopify Partners dashboard
+application_url = "https://api.getfindable.au/shopify"
+embedded = false
+
+[access_scopes]
+scopes = "read_products,write_script_tags,read_script_tags,read_themes,read_locales"
+
+[auth]
+redirect_urls = [
+  "https://api.getfindable.au/shopify/callback",
+  "http://localhost:3001/shopify/callback"
+]
+
+[webhooks]
+api_version = "2026-01"
+
+  [webhooks.privacy_compliance]
+  customer_data_request_url = "https://api.getfindable.au/shopify/webhooks"
+  customer_deletion_url = "https://api.getfindable.au/shopify/webhooks"
+  shop_deletion_url = "https://api.getfindable.au/shopify/webhooks"
+
+[[webhooks.subscriptions]]
+topics = [
+  "products/create",
+  "products/update",
+  "products/delete",
+  "app/uninstalled",
+  "bulk_operations/finish"
+]
+uri = "https://api.getfindable.au/shopify/webhooks"
+
+[app_proxy]
+url = "https://api.getfindable.au/api/proxy"
+subpath = "findable"
+prefix = "apps"
+# Accessible at: https://your-store.myshopify.com/apps/findable/*
+
+[pos]
+embedded = false
