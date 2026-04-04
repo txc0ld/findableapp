@@ -138,35 +138,54 @@ function appBridgeBootstrap(apiKey: string, shop: string): string {
   </div>
   <script data-api-key="${escapeHtml(apiKey)}" src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
   <script>
-    (async function() {
+    function updateStatus(msg) { document.getElementById('status').textContent = msg; }
+    function showError(msg) {
+      document.getElementById('error').style.display = 'block';
+      document.getElementById('error').textContent = msg;
+      document.getElementById('status').textContent = '';
+      document.querySelector('.spinner').style.display = 'none';
+      console.error('[FindAble]', msg);
+    }
+
+    function waitForShopify(attempts) {
+      if (typeof shopify !== 'undefined' && shopify.idToken) {
+        console.log('[FindAble] App Bridge ready');
+        doSetup();
+      } else if (attempts > 50) {
+        showError('App Bridge failed to load. Please refresh.');
+      } else {
+        setTimeout(function() { waitForShopify(attempts + 1); }, 100);
+      }
+    }
+
+    async function doSetup() {
       try {
-        document.getElementById('status').textContent = 'Authenticating...';
-        // Get session token from App Bridge
+        updateStatus('Authenticating...');
+        console.log('[FindAble] Getting session token...');
         var token = await shopify.idToken();
-        document.getElementById('status').textContent = 'Creating your account...';
-        // Send token to our server for exchange
+        console.log('[FindAble] Got token, length:', token ? token.length : 0);
+
+        updateStatus('Creating your account...');
         var res = await fetch('/app/auth/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: token, shop: '${escapeHtml(shop)}' })
         });
+        console.log('[FindAble] Setup response:', res.status);
+
         if (res.ok) {
-          // Reload the page — store now exists in DB, middleware will serve the dashboard
+          updateStatus('Ready! Reloading...');
           window.location.reload();
         } else {
           var data = await res.json().catch(function() { return {}; });
-          document.getElementById('error').style.display = 'block';
-          document.getElementById('error').textContent = data.error || 'Setup failed. Please try again.';
-          document.getElementById('status').textContent = '';
-          document.querySelector('.spinner').style.display = 'none';
+          showError(data.error || 'Setup failed (' + res.status + '). Please refresh.');
         }
       } catch(e) {
-        document.getElementById('error').style.display = 'block';
-        document.getElementById('error').textContent = 'Error: ' + e.message;
-        document.getElementById('status').textContent = '';
-        document.querySelector('.spinner').style.display = 'none';
+        showError('Error: ' + e.message);
       }
-    })();
+    }
+
+    waitForShopify(0);
   </script>
 </body>
 </html>`;
