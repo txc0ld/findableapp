@@ -110,13 +110,46 @@ function renderPage(title: string, content: string, apiKey: string): string {
 /*  `shop` query param (basic lookup, no signature check).            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * App Bridge bootstrap page — served when we can't authenticate yet.
+ * App Bridge handles the OAuth/auth flow inside the Shopify admin iframe,
+ * then reloads the page with the proper id_token for token exchange.
+ */
+function appBridgeBootstrap(apiKey: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FindAble</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #f6f6f7; }
+    .loading { text-align: center; color: #6b7280; }
+    .spinner { width: 32px; height: 32px; border: 3px solid #e5e7eb; border-top-color: #4f46e5; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="loading">
+    <div class="spinner"></div>
+    <p>Setting up FindAble...</p>
+  </div>
+  <script data-api-key="${escapeHtml(apiKey)}" src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+</body>
+</html>`;
+}
+
 const appRoute = new Hono<{ Variables: ShopifySessionVariables }>();
 
-// Allow Shopify admin to iframe this app
+// Allow Shopify admin to iframe this app — must run on ALL responses
 appRoute.use("*", async (c, next) => {
-  c.header("Content-Security-Policy", "frame-ancestors https://*.myshopify.com https://admin.shopify.com;");
+  await next();
+  c.res.headers.set("Content-Security-Policy", "frame-ancestors https://*.myshopify.com https://admin.shopify.com;");
   c.res.headers.delete("X-Frame-Options");
+});
 
+// Auth middleware
+appRoute.use("*", async (c, next) => {
   if (!db) {
     return c.html("<p>Database not configured.</p>", 503);
   }
@@ -142,7 +175,8 @@ appRoute.use("*", async (c, next) => {
   }
 
   if (!shopDomain) {
-    return c.html("<p>Missing shop parameter. Please open this app from the Shopify admin.</p>", 400);
+    // No shop info — serve App Bridge bootstrap page that handles auth
+    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""));
   }
 
   let store = await db.query.stores.findFirst({
@@ -221,9 +255,10 @@ appRoute.use("*", async (c, next) => {
   }
 
   if (!store) {
-    // Redirect to OAuth install as fallback
-    const installUrl = `/shopify?shop=${encodeURIComponent(shopDomain)}`;
-    return c.redirect(installUrl);
+    // Store not in DB yet — serve App Bridge bootstrap page.
+    // App Bridge will handle auth and provide the session token,
+    // then reload the page with id_token so we can do token exchange.
+    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""));
   }
 
   c.set("shopifyStore", store);
