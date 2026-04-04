@@ -9,7 +9,6 @@ import { encryptShopifyAccessToken } from "../lib/shopify";
 import { decryptAccessToken } from "../lib/shopify-client";
 import { syncAllProducts, getProductCount, getShopInfo, buildStoreConfig, policyFlags } from "../services/product-sync";
 import { startBulkProductSync } from "../services/bulk-operations";
-import { installScriptTag } from "../services/script-tags";
 import { testLlmVisibility } from "../services/llm-tester";
 import { analyzeWithAi } from "../services/ai-analyzer";
 import type { AiAnalysisInput } from "../services/ai-analyzer";
@@ -17,6 +16,34 @@ import { auditEntityConsistency } from "../services/entity-audit";
 import { detectMismatches } from "../services/mismatch-detector";
 import type { MappedProduct } from "../types/shopify";
 import { env } from "../lib/env";
+
+/* ------------------------------------------------------------------ */
+/*  Rate limiter — max 1 concurrent operation per store per type      */
+/* ------------------------------------------------------------------ */
+
+const inProgress = new Map<string, Set<string>>();
+
+function acquireOp(storeId: string, op: string): boolean {
+  let ops = inProgress.get(storeId);
+  if (!ops) {
+    ops = new Set();
+    inProgress.set(storeId, ops);
+  }
+  if (ops.has(op)) return false;
+  ops.add(op);
+  return true;
+}
+
+function releaseOp(storeId: string, op: string): void {
+  const ops = inProgress.get(storeId);
+  if (ops) {
+    ops.delete(op);
+    if (ops.size === 0) inProgress.delete(storeId);
+  }
+}
+
+/** H6: Maximum products per fix-all operation (plan tier cap). */
+const FIX_ALL_PRODUCT_LIMIT = 100;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -29,6 +56,11 @@ function scoreColor(score: number): string {
   if (score <= 70) return "#84cc16";
   if (score <= 85) return "#10b981";
   return "#06b6d4";
+}
+
+/** Derive a simple feed token from the store UUID (first 16 hex chars). */
+function feedToken(storeId: string): string {
+  return storeId.replace(/-/g, "").slice(0, 16);
 }
 
 function escapeHtml(str: string): string {
@@ -390,44 +422,6 @@ const APP_JS = `(function() {
     }
   };
 
-  /* ---- Settings: install script tags ---- */
-  window.findableInstallScriptTag = async function() {
-    var btn = document.getElementById('install-script-btn');
-    var status = document.getElementById('script-status');
-    if (!btn || !status) return;
-
-    btn.disabled = true;
-    btn.textContent = 'Installing...';
-    status.style.display = 'block';
-    status.style.background = '#eff6ff';
-    status.style.color = '#2563eb';
-    status.textContent = 'Installing script tags...';
-
-    try {
-      var res = await fetch('/app/script-tags', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
-      var data = await res.json();
-      if (res.ok) {
-        status.style.background = '#f0fdf4';
-        status.style.color = '#16a34a';
-        status.textContent = 'Script tags installed successfully.';
-      } else {
-        status.style.background = '#fef2f2';
-        status.style.color = '#dc2626';
-        status.textContent = data.error || 'Installation failed. Please try again.';
-      }
-    } catch(e) {
-      status.style.background = '#fef2f2';
-      status.style.color = '#dc2626';
-      status.textContent = 'Network error. Please check your connection.';
-    }
-
-    btn.disabled = false;
-    btn.textContent = 'Install Script Tags';
-  };
-
   /* ---- Product Detail: auto-fix ---- */
   window.findableAutoFix = async function(productId) {
     var btn = document.getElementById('fix-btn');
@@ -719,23 +713,6 @@ appRoute.use("*", async (c, next) => {
   const idToken = c.req.query("id_token");
 
   if (!idToken) {
-    // No id_token — try shop query param for in-app navigation.
-    // If the store already exists, serve the page (read-only is safe).
-    // POST actions still require the session token via Authorization header.
-    const shopParam = c.req.query("shop")?.replace(/^https?:\/\//, "");
-    if (shopParam) {
-      const existingStore = await db.query.stores.findFirst({
-        where: eq(stores.shopifyShop, shopParam),
-      });
-      if (existingStore) {
-        console.log(`[app] No id_token but store exists for ${shopParam} — serving page`);
-        c.set("shopifyStore", existingStore);
-        c.set("shopifyShop", shopParam);
-        return next();
-      }
-    }
-
-    // No token AND no existing store — serve bounce page.
     console.log("[app] No id_token — serving bounce page");
     return c.html(bouncePage(apiKey));
   }
@@ -748,19 +725,6 @@ appRoute.use("*", async (c, next) => {
     console.log(`[app] id_token verified for shop: ${shop}`);
   } catch (err) {
     console.error("[app] id_token verification failed:", err);
-    // Token expired/invalid — fall back to shop param if store exists
-    const shopFallback = c.req.query("shop")?.replace(/^https?:\/\//, "");
-    if (shopFallback) {
-      const existingStore = await db.query.stores.findFirst({
-        where: eq(stores.shopifyShop, shopFallback),
-      });
-      if (existingStore) {
-        console.log(`[app] Expired id_token but store exists for ${shopFallback} — serving page`);
-        c.set("shopifyStore", existingStore);
-        c.set("shopifyShop", shopFallback);
-        return next();
-      }
-    }
     return c.html(bouncePage(apiKey));
   }
 
@@ -793,27 +757,6 @@ appRoute.use("*", async (c, next) => {
 /*  POST /sync  — Trigger product sync                                */
 /* ------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------ */
-/*  POST /cleanup  — Delete all products + issues for this store      */
-/* ------------------------------------------------------------------ */
-
-appRoute.post("/cleanup", async (c) => {
-  const store = c.get("shopifyStore");
-  if (!db) return c.json({ success: false, error: "No database" }, 503);
-
-  // Delete issues linked to this store's products
-  const storeProducts = await db.select({ id: products.id }).from(products).where(eq(products.storeId, store.id));
-  for (const p of storeProducts) {
-    await db.delete(issues).where(eq(issues.productId, p.id));
-  }
-  // Delete all products
-  await db.delete(products).where(eq(products.storeId, store.id));
-  // Delete all scans
-  await db.delete(scans).where(eq(scans.storeId, store.id));
-
-  return c.json({ success: true, deleted: storeProducts.length });
-});
-
 appRoute.post("/sync", async (c) => {
   const store = c.get("shopifyStore");
 
@@ -841,7 +784,12 @@ appRoute.post("/sync", async (c) => {
 appRoute.post("/scan", async (c) => {
   const store = c.get("shopifyStore");
 
+  if (!acquireOp(store.id, "scan")) {
+    return c.json({ success: false, error: "A scan is already in progress for this store." }, 429);
+  }
+
   if (!db) {
+    releaseOp(store.id, "scan");
     return c.json({ success: false, error: "Database not configured." }, 503);
   }
 
@@ -878,9 +826,9 @@ appRoute.post("/scan", async (c) => {
   }
 
   // Fire-and-forget: score all products from DB data (no HTTP, no AI)
-  scoreProductsFromDb(scanRecord.id, store.id).catch((err) =>
-    console.error("[app/scan] Background scan failed:", err),
-  );
+  scoreProductsFromDb(scanRecord.id, store.id)
+    .catch((err) => console.error("[app/scan] Background scan failed:", err))
+    .finally(() => releaseOp(store.id, "scan"));
 
   return c.json({
     success: true,
@@ -1143,22 +1091,6 @@ async function scoreProductsFromDb(scanId: string, storeId: string): Promise<voi
 }
 
 /* ------------------------------------------------------------------ */
-/*  POST /script-tags  — Install script tags                          */
-/* ------------------------------------------------------------------ */
-
-appRoute.post("/script-tags", async (c) => {
-  const store = c.get("shopifyStore");
-
-  if (!store.shopifyShop || !store.shopifyAccessToken) {
-    return c.json({ success: false, error: "Store is missing Shopify credentials." }, 400);
-  }
-
-  const accessToken = decryptAccessToken(store.shopifyAccessToken);
-  await installScriptTag(store.shopifyShop, accessToken, store.id);
-  return c.json({ success: true });
-});
-
-/* ------------------------------------------------------------------ */
 /*  POST /visibility-test  — LLM visibility testing (Pro tier)        */
 /* ------------------------------------------------------------------ */
 
@@ -1168,11 +1100,17 @@ const visibilityResults = new Map<string, { status: string; data?: unknown; erro
 appRoute.post("/visibility-test", async (c) => {
   const store = c.get("shopifyStore");
 
+  if (!acquireOp(store.id, "visibility")) {
+    return c.json({ success: false, error: "A visibility test is already in progress for this store." }, 429);
+  }
+
   if (!db) {
+    releaseOp(store.id, "visibility");
     return c.json({ success: false, error: "Database not configured." }, 503);
   }
 
   if (!env.OPENAI_API_KEY) {
+    releaseOp(store.id, "visibility");
     return c.json({ success: false, error: "OpenAI API key not configured." }, 503);
   }
 
@@ -1237,6 +1175,8 @@ appRoute.post("/visibility-test", async (c) => {
     } catch (err) {
       console.error("[app] Visibility test error:", err);
       visibilityResults.set(store.id, { status: "error", error: err instanceof Error ? err.message : "Failed" });
+    } finally {
+      releaseOp(store.id, "visibility");
     }
   })();
 
@@ -1402,9 +1342,10 @@ appRoute.get("/", async (c) => {
   }
 
   // ── Feed URLs ────────────────────────────────────────────────────
+  const storeToken = feedToken(store.id);
   const themeEditorUrl = `https://admin.shopify.com/store/${escapeHtml(shopName)}/themes/current/editor?context=apps`;
-  const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}`;
-  const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}`;
+  const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}`;
+  const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}`;
   const llmsTxtUrl = `https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}`;
 
   // ── Helper to render step state ─────────────────────────────────
@@ -1792,8 +1733,8 @@ appRoute.get("/settings", async (c) => {
   const plan = account?.plan ?? "free";
   const planLabel = plan.charAt(0).toUpperCase() + plan.slice(1);
 
-  const hasScriptTag = Boolean(store.shopifyAccessToken);
   const shopDomain = store.shopifyShop ?? store.url ?? "Unknown";
+  const storeToken = feedToken(store.id);
   const installedAt = store.shopifyInstalledAt
     ? new Date(store.shopifyInstalledAt).toLocaleString("en-AU", {
         dateStyle: "medium",
@@ -1812,18 +1753,6 @@ appRoute.get("/settings", async (c) => {
       <div class="actions">
         <a class="btn btn-primary" href="${escapeHtml(frontendUrl)}/dashboard/settings" target="_top">Manage Billing</a>
       </div>
-    </div>
-
-    <div class="card">
-      <h2 class="card-title">Script Tag</h2>
-      <div class="stat-row">
-        <span class="stat-label">Status</span>
-        <span class="stat-value">${hasScriptTag ? '<span style="color: #16a34a;">Installed</span>' : '<span style="color: #dc2626;">Not installed</span>'}</span>
-      </div>
-      <div class="actions">
-        <button class="btn btn-primary" id="install-script-btn" onclick="findableInstallScriptTag()">Install Script Tags</button>
-      </div>
-      <div id="script-status" style="display: none; margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 13px;"></div>
     </div>
 
     <div class="card">
@@ -1852,16 +1781,16 @@ appRoute.get("/settings", async (c) => {
       <div class="stat-row">
         <span class="stat-label">ACP Feed (ChatGPT)</span>
         <span class="stat-value" style="font-size: 12px; word-break: break-all;">
-          <a href="https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}" target="_blank" style="color: #2563eb;">
-            https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}
+          <a href="https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}" target="_blank" style="color: #2563eb;">
+            https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}
           </a>
         </span>
       </div>
       <div class="stat-row">
         <span class="stat-label">GMC Feed (Google)</span>
         <span class="stat-value" style="font-size: 12px; word-break: break-all;">
-          <a href="https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}" target="_blank" style="color: #2563eb;">
-            https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}
+          <a href="https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}" target="_blank" style="color: #2563eb;">
+            https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}
           </a>
         </span>
       </div>
@@ -2255,7 +2184,12 @@ appRoute.post("/products/:id/restore", async (c) => {
 appRoute.post("/fix-all", async (c) => {
   const store = c.get("shopifyStore");
 
+  if (!acquireOp(store.id, "fix-all")) {
+    return c.json({ success: false, error: "A bulk fix is already in progress for this store." }, 429);
+  }
+
   if (!db) {
+    releaseOp(store.id, "fix-all");
     return c.json({ success: false, error: "Database not configured." }, 503);
   }
 
@@ -2265,7 +2199,16 @@ appRoute.post("/fix-all", async (c) => {
     .where(eq(products.storeId, store.id));
 
   if (storeProducts.length === 0) {
+    releaseOp(store.id, "fix-all");
     return c.json({ success: false, error: "No products found. Sync your products first." }, 400);
+  }
+
+  if (storeProducts.length > FIX_ALL_PRODUCT_LIMIT) {
+    releaseOp(store.id, "fix-all");
+    return c.json({
+      success: false,
+      error: `Fix-all is limited to ${FIX_ALL_PRODUCT_LIMIT} products per operation. Your store has ${storeProducts.length} products. Please fix products individually or contact support for a higher limit.`,
+    }, 400);
   }
 
   // Process in background — return immediately
@@ -2343,7 +2286,9 @@ appRoute.post("/fix-all", async (c) => {
       }
     }
     console.log(`[fix-all] Bulk fix complete for ${productIds.length} products in store ${store.id}`);
-  })().catch((err) => console.error("[fix-all] Background process error:", err));
+  })()
+    .catch((err) => console.error("[fix-all] Background process error:", err))
+    .finally(() => releaseOp(store.id, "fix-all"));
 
   return c.json({
     success: true,
@@ -2361,9 +2306,10 @@ appRoute.get("/setup", async (c) => {
   const shopDomain = store.shopifyShop ?? store.url ?? "unknown";
   const shopName = shopDomain.replace(/\.myshopify\.com$/, "");
 
+  const storeToken = feedToken(store.id);
   const themeEditorUrl = `https://admin.shopify.com/store/${escapeHtml(shopName)}/themes/current/editor?context=apps`;
-  const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}`;
-  const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}`;
+  const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}`;
+  const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}`;
   const llmsTxtUrl = `https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}`;
 
   const content = `

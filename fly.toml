@@ -18,6 +18,16 @@ primary_region = "syd"
   auto_start_machines = true
   min_machines_running = 1
 
+[checks]
+  [checks.health]
+    port = 3001
+    type = "http"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/api/health"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"

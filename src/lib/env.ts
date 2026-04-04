@@ -8,7 +8,7 @@ const EnvSchema = z.object({
   FRONTEND_URL: z.string().url().default("http://localhost:5173"),
   CORS_ORIGINS: z.string().optional(),
   CLOUDFLARE_TURNSTILE_SECRET: z.string().optional(),
-  JWT_SECRET: z.string().min(32).default("findable-local-jwt-secret-change-me-123456"),
+  JWT_SECRET: z.string().min(32),
   JWT_ISSUER: z.string().default("findable-api"),
   RESEND_API_KEY: z.string().optional(),
   RESEND_FROM_EMAIL: z.string().default("Findable <no-reply@getfindable.au>"),
@@ -17,7 +17,7 @@ const EnvSchema = z.object({
   SHOPIFY_API_SECRET: z.string().optional(),
   SHOPIFY_APP_URL: z.string().url().optional(),
   SHOPIFY_TOKEN_ENCRYPTION_KEY: z.string().optional(),
-  SHOPIFY_API_VERSION: z.string().default("2026-01"),
+  SHOPIFY_API_VERSION: z.string().default("2026-04"),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_MODEL: z.string().default("gpt-4o"),
 });

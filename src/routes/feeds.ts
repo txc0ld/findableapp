@@ -13,27 +13,13 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 
 import { db } from "../db/client";
-import { issues, products, scans, stores } from "../db/schema";
+import { products, stores } from "../db/schema";
 import { generateAcpFeed, generateGmcSupplementalFeed } from "../services/feed-generator";
+import { getShopInfo } from "../services/product-sync";
+import { decryptAccessToken } from "../lib/shopify-client";
 import type { StoreConfig } from "../services/schema-generator";
 
 export const feedsRoute = new Hono();
-
-// One-time cleanup — DELETE after use
-feedsRoute.get("/cleanup/:shop", async (c) => {
-  if (!db) return c.text("No DB", 503);
-  const shop = c.req.param("shop");
-  const store = await db.query.stores.findFirst({ where: eq(stores.shopifyShop, shop) });
-  if (!store) return c.text("Store not found", 404);
-
-  const allProducts = await db.select({ id: products.id }).from(products).where(eq(products.storeId, store.id));
-  for (const p of allProducts) {
-    await db.delete(issues).where(eq(issues.productId, p.id));
-  }
-  await db.delete(products).where(eq(products.storeId, store.id));
-  await db.delete(scans).where(eq(scans.storeId, store.id));
-  return c.json({ success: true, deleted: allProducts.length });
-});
 
 /* ------------------------------------------------------------------ */
 /*  Helper: look up store by shopify domain                           */
@@ -46,13 +32,36 @@ async function findStoreByShop(shop: string) {
   });
 }
 
-function buildStoreConfig(store: { name: string | null; url: string }): StoreConfig {
-  return {
+/** Derive a simple feed token from the store UUID (first 16 hex chars). */
+function feedToken(storeId: string): string {
+  return storeId.replace(/-/g, "").slice(0, 16);
+}
+
+async function buildStoreConfig(store: {
+  name: string | null;
+  url: string;
+  shopifyShop: string | null;
+  shopifyAccessToken: string | null;
+}): Promise<StoreConfig> {
+  const config: StoreConfig = {
     storeName: store.name ?? "Store",
     storeUrl: store.url,
     currency: "AUD",
     country: "AU",
   };
+
+  if (store.shopifyShop && store.shopifyAccessToken) {
+    try {
+      const accessToken = decryptAccessToken(store.shopifyAccessToken);
+      const shopInfo = await getShopInfo(store.shopifyShop, accessToken);
+      config.currency = shopInfo.currencyCode || "AUD";
+      config.country = shopInfo.country || "AU";
+    } catch (err) {
+      console.error("[feeds] Failed to fetch shop info for currency:", err);
+    }
+  }
+
+  return config;
 }
 
 /* ------------------------------------------------------------------ */
@@ -66,8 +75,13 @@ feedsRoute.get("/acp/:shop", async (c) => {
     return c.json({ error: "Store not found" }, 404);
   }
 
+  const token = c.req.query("token");
+  if (!token || token !== feedToken(store.id)) {
+    return c.json({ error: "Invalid or missing feed token" }, 403);
+  }
+
   try {
-    const config = buildStoreConfig(store);
+    const config = await buildStoreConfig(store);
     const { gzipped, productCount } = await generateAcpFeed(store.id, config);
 
     if (productCount === 0) {
@@ -100,8 +114,13 @@ feedsRoute.get("/gmc/:shop", async (c) => {
     return c.json({ error: "Store not found" }, 404);
   }
 
+  const token = c.req.query("token");
+  if (!token || token !== feedToken(store.id)) {
+    return c.json({ error: "Invalid or missing feed token" }, 403);
+  }
+
   try {
-    const config = buildStoreConfig(store);
+    const config = await buildStoreConfig(store);
     const tsv = await generateGmcSupplementalFeed(store.id, config);
 
     c.header("Content-Type", "text/tab-separated-values; charset=utf-8");

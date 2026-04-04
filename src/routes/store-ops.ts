@@ -6,10 +6,9 @@ import { decryptAccessToken } from "../lib/shopify-client";
 import { db } from "../db/client";
 import { stores, products } from "../db/schema";
 import type { Store } from "../db/schema";
-import { syncAllProducts, getProductCount, getShopInfo } from "../services/product-sync";
+import { syncAllProducts, getProductCount, getShopInfo, buildStoreConfig as buildLiveStoreConfig } from "../services/product-sync";
 import { startBulkProductSync } from "../services/bulk-operations";
 import { generateAcpFeed, generateGmcSupplementalFeed, saveFeedRecord } from "../services/feed-generator";
-import { installScriptTag, removeAllScriptTags, listScriptTags } from "../services/script-tags";
 import type { StoreConfig } from "../services/schema-generator";
 
 const storeOpsRoute = new Hono<{ Variables: AuthVariables }>();
@@ -27,13 +26,8 @@ async function getActiveStore(accountId: string) {
   });
 }
 
-function buildStoreConfig(store: Store): StoreConfig {
-  return {
-    storeName: store.name ?? "Store",
-    storeUrl: store.url,
-    currency: "USD",
-    country: "US",
-  };
+async function buildStoreConfig(store: Store): Promise<StoreConfig> {
+  return buildLiveStoreConfig(store);
 }
 
 // ── POST /sync ──────────────────────────────────────────────────────────────────
@@ -107,7 +101,7 @@ storeOpsRoute.post("/feeds/acp", async (c) => {
     return c.json({ success: false, error: "No active Shopify store found." }, 404);
   }
 
-  const storeConfig = buildStoreConfig(store);
+  const storeConfig = await buildStoreConfig(store);
   const result = await generateAcpFeed(store.id, storeConfig);
 
   // TODO: Upload gzipped feed to R2 and return URL
@@ -128,7 +122,7 @@ storeOpsRoute.post("/feeds/gmc", async (c) => {
     return c.json({ success: false, error: "No active Shopify store found." }, 404);
   }
 
-  const storeConfig = buildStoreConfig(store);
+  const storeConfig = await buildStoreConfig(store);
   const tsv = await generateGmcSupplementalFeed(store.id, storeConfig);
 
   const productCount = tsv.split("\n").length - 1; // subtract header row
@@ -138,72 +132,6 @@ storeOpsRoute.post("/feeds/gmc", async (c) => {
   return c.json({
     success: true,
     data: { productCount, tsv },
-  });
-});
-
-// ── POST /script-tags/install ───────────────────────────────────────────────────
-storeOpsRoute.post("/script-tags/install", async (c) => {
-  const authAccount = c.get("authAccount");
-  const store = await getActiveStore(authAccount.id);
-
-  if (!store) {
-    return c.json({ success: false, error: "No active Shopify store found." }, 404);
-  }
-
-  if (!store.shopifyShop || !store.shopifyAccessToken) {
-    return c.json({ success: false, error: "Store is missing Shopify credentials." }, 400);
-  }
-
-  const accessToken = decryptAccessToken(store.shopifyAccessToken);
-  const result = await installScriptTag(store.shopifyShop, accessToken, store.id);
-
-  return c.json({
-    success: true,
-    data: { id: result.id, src: result.src },
-  });
-});
-
-// ── DELETE /script-tags ─────────────────────────────────────────────────────────
-storeOpsRoute.delete("/script-tags", async (c) => {
-  const authAccount = c.get("authAccount");
-  const store = await getActiveStore(authAccount.id);
-
-  if (!store) {
-    return c.json({ success: false, error: "No active Shopify store found." }, 404);
-  }
-
-  if (!store.shopifyShop || !store.shopifyAccessToken) {
-    return c.json({ success: false, error: "Store is missing Shopify credentials." }, 400);
-  }
-
-  const accessToken = decryptAccessToken(store.shopifyAccessToken);
-  const count = await removeAllScriptTags(store.shopifyShop, accessToken);
-
-  return c.json({
-    success: true,
-    data: { removed: count },
-  });
-});
-
-// ── GET /script-tags ────────────────────────────────────────────────────────────
-storeOpsRoute.get("/script-tags", async (c) => {
-  const authAccount = c.get("authAccount");
-  const store = await getActiveStore(authAccount.id);
-
-  if (!store) {
-    return c.json({ success: false, error: "No active Shopify store found." }, 404);
-  }
-
-  if (!store.shopifyShop || !store.shopifyAccessToken) {
-    return c.json({ success: false, error: "Store is missing Shopify credentials." }, 400);
-  }
-
-  const accessToken = decryptAccessToken(store.shopifyAccessToken);
-  const scriptTags = await listScriptTags(store.shopifyShop, accessToken);
-
-  return c.json({
-    success: true,
-    data: { scriptTags },
   });
 });
 
