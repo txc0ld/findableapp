@@ -151,11 +151,13 @@ appRoute.use("*", async (c, next) => {
 // Auth middleware
 appRoute.use("*", async (c, next) => {
   if (!db) {
-    return c.html("<p>Database not configured.</p>", 503);
+    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""), 200);
   }
 
   const idToken = c.req.query("id_token");
   const shopParam = c.req.query("shop");
+
+  console.log(`[app] Request: id_token=${idToken ? "present" : "absent"}, shop=${shopParam ?? "absent"}`);
 
   let shopDomain: string | null = null;
 
@@ -164,19 +166,21 @@ appRoute.use("*", async (c, next) => {
     try {
       const result = await verifyShopifySessionToken(idToken);
       shopDomain = result.shop;
-    } catch {
-      // Token verification failed — fall through to shop param
+      console.log(`[app] Token verified for shop: ${shopDomain}`);
+    } catch (err) {
+      console.error("[app] Token verification failed:", err);
     }
   }
 
-  // Fallback: use shop query param (unsigned, but still useful for dev/initial loads)
+  // Fallback: use shop query param
   if (!shopDomain && shopParam) {
     shopDomain = shopParam.replace(/^https?:\/\//, "");
+    console.log(`[app] Using shop param: ${shopDomain}`);
   }
 
   if (!shopDomain) {
-    // No shop info — serve App Bridge bootstrap page that handles auth
-    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""));
+    console.log("[app] No shop domain — serving bootstrap");
+    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""), 200);
   }
 
   let store = await db.query.stores.findFirst({
@@ -203,6 +207,11 @@ appRoute.use("*", async (c, next) => {
         },
       );
 
+      console.log(`[app] Token exchange response: ${tokenExchangeResponse.status}`);
+      if (!tokenExchangeResponse.ok) {
+        const errText = await tokenExchangeResponse.text();
+        console.error(`[app] Token exchange failed: ${tokenExchangeResponse.status} ${errText}`);
+      }
       if (tokenExchangeResponse.ok) {
         const tokenData = (await tokenExchangeResponse.json()) as {
           access_token: string;
@@ -248,18 +257,19 @@ appRoute.use("*", async (c, next) => {
         }).returning();
 
         store = inserted[0];
+        console.log(`[app] Store created: ${store?.id} for ${shopDomain}`);
       }
     } catch (e) {
-      console.error("[app] Token exchange failed:", e);
+      console.error("[app] Token exchange error:", e);
     }
   }
 
   if (!store) {
-    // Store not in DB yet — serve App Bridge bootstrap page.
-    // App Bridge will handle auth and provide the session token,
-    // then reload the page with id_token so we can do token exchange.
-    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""));
+    console.log(`[app] No store for ${shopDomain} — serving bootstrap`);
+    return c.html(appBridgeBootstrap(env.SHOPIFY_API_KEY ?? ""), 200);
   }
+
+  console.log(`[app] Authenticated: store=${store.id}, shop=${shopDomain}`);
 
   c.set("shopifyStore", store);
   c.set("shopifyShop", shopDomain);
