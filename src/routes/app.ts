@@ -277,18 +277,10 @@ appRoute.use("*", async (c, next) => {
 const APP_JS = `(function() {
   'use strict';
 
-  /* ---- Fix nav links: add shop param for in-app navigation ---- */
+  /* ---- Fix ALL in-app links: add shop param for navigation ---- */
   var shop = new URLSearchParams(window.location.search).get('shop') || '';
   if (shop) {
-    document.querySelectorAll('nav.nav a').forEach(function(a) {
-      var url = new URL(a.href, window.location.origin);
-      if (!url.searchParams.has('shop')) {
-        url.searchParams.set('shop', shop);
-        a.href = url.toString();
-      }
-    });
-    // Also fix any in-page links to /app/products/
-    document.querySelectorAll('a[href^="/app/products/"]').forEach(function(a) {
+    document.querySelectorAll('a[href^="/app"]').forEach(function(a) {
       var url = new URL(a.href, window.location.origin);
       if (!url.searchParams.has('shop')) {
         url.searchParams.set('shop', shop);
