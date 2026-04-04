@@ -30,7 +30,7 @@ api_version = "2026-04"
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_locales,read_products,read_script_tags,write_script_tags,read_themes"
 optional_scopes = [ ]
-use_legacy_install_flow = false
+use_legacy_install_flow = true
 
 [auth]
 redirect_urls = [ "https://api.getfindable.au/shopify/callback" ]
