@@ -1,0 +1,8 @@
+type = "backend"
+
+[commands]
+dev = "bun --watch src/index.ts"
+
+[commands.env]
+PORT = "3001"
+BACKEND_PORT = "3001"
