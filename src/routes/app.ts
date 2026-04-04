@@ -95,7 +95,6 @@ function renderPage(title: string, content: string, apiKey: string): string {
     </nav>
     ${content}
   </div>
-  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="${escapeHtml(apiKey)}"></script>
   <script src="/app/assets/app.js"></script>
 </body>
 </html>`;
@@ -127,7 +126,6 @@ function setupPage(apiKey: string): string {
     <p id="status">Setting up FindAble...</p>
     <p id="error" class="error"></p>
   </div>
-  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="${escapeHtml(apiKey)}"></script>
   <script src="/app/assets/app.js"></script>
 </body>
 </html>`;
