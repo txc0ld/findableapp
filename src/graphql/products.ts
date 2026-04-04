@@ -228,8 +228,6 @@ export const BULK_PRODUCTS_QUERY = `
                       name
                       value
                     }
-                    weight
-                    weightUnit
                   }
                 }
               }
