@@ -67,8 +67,6 @@ export const PRODUCT_FRAGMENT = `
             width
             height
           }
-          weight
-          weightUnit
           presentmentPrices(first: 1) {
             edges {
               node {

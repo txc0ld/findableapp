@@ -102,8 +102,8 @@ function mapShopifyProduct(product: ShopifyProduct, shopDomain: string, fallback
       available: e.node.availableForSale,
       options: e.node.selectedOptions,
       image: e.node.image?.url ?? null,
-      weight: e.node.weight,
-      weightUnit: e.node.weightUnit,
+      weight: e.node.weight ?? null,
+      weightUnit: e.node.weightUnit ?? null,
     })),
     collections: product.collections.edges.map((e) => ({
       title: e.node.title,
