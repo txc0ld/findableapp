@@ -951,14 +951,22 @@ function scoreProductFromDb(product: {
   hasColor: boolean;
   hasSize: boolean;
   originalDescription: string | null;
+  rewrittenDescription: string | null;
+  generatedSchema: unknown;
+  suggestedFaq: unknown;
+  aeoScore: number | null;
 }): { schema: number; llm: number; protocol: number; issues: ScoredIssue[] } {
   const scoredIssues: ScoredIssue[] = [];
   let schema = 18; // base
   let llm = 22; // base
   let protocol = 10; // base
 
+  // Account for FindAble-generated content
+  const hasSchema = product.hasJsonld || product.generatedSchema != null;
+  const hasFaq = product.hasFaqSchema || (Array.isArray(product.suggestedFaq) && product.suggestedFaq.length > 0);
+
   // Schema scoring
-  if (product.hasJsonld) schema += 12;
+  if (hasSchema) schema += 12;
   else scoredIssues.push({ severity: "critical", title: "No JSON-LD schema detected", dimension: "schema", pointsImpact: 12 });
 
   if (product.hasGtin) schema += 10;
@@ -976,17 +984,17 @@ function scoreProductFromDb(product: {
   if (product.hasReviewSchema) schema += 6;
   else scoredIssues.push({ severity: "medium", title: "No review/rating schema", dimension: "schema", pointsImpact: 6 });
 
-  if (product.hasFaqSchema) schema += 4;
+  if (hasFaq) schema += 4;
 
   if (product.hasVariantsStructured) schema += 4;
 
-  // LLM scoring
-  const desc = product.originalDescription ?? "";
+  // LLM scoring — use rewritten description if available (longer, better quality)
+  const desc = product.rewrittenDescription ?? product.originalDescription ?? "";
   const descLength = desc.length;
-  llm += Math.min(26, Math.floor(descLength / 12)); // up to 26 points for description length
+  llm += Math.min(26, Math.floor(descLength / 12));
 
   if (product.hasBrand) llm += 8;
-  if (product.hasFaqSchema) llm += 12;
+  if (hasFaq) llm += 12;
   if (product.hasMaterial || product.hasColor || product.hasSize) llm += 10;
   if (product.hasReviewSchema) llm += 10;
 
@@ -1028,6 +1036,10 @@ async function scoreProductsFromDb(scanId: string, storeId: string): Promise<voi
         hasColor: products.hasColor,
         hasSize: products.hasSize,
         originalDescription: products.originalDescription,
+        rewrittenDescription: products.rewrittenDescription,
+        generatedSchema: products.generatedSchema,
+        suggestedFaq: products.suggestedFaq,
+        aeoScore: products.aeoScore,
       })
       .from(products)
       .where(eq(products.storeId, storeId));
@@ -1040,12 +1052,17 @@ async function scoreProductsFromDb(scanId: string, storeId: string): Promise<voi
     for (const product of allProducts) {
       const result = scoreProductFromDb(product);
 
+      // Blend AI AEO score if available
+      const finalLlm = product.aeoScore
+        ? Math.round(product.aeoScore * 0.7 + result.llm * 0.3)
+        : result.llm;
+
       // Update product scores
       await db
         .update(products)
         .set({
           schemaScore: result.schema,
-          llmScore: result.llm,
+          llmScore: finalLlm,
           scanId: scanId,
         })
         .where(eq(products.id, product.id));
