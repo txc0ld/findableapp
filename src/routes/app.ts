@@ -5,6 +5,7 @@ import { db } from "../db/client";
 import { accounts, stores, products, issues, scans } from "../db/schema";
 import type { ShopifySessionVariables } from "../lib/shopify-session";
 import { verifyShopifySessionToken } from "../lib/shopify-session";
+import { encryptShopifyAccessToken } from "../lib/shopify";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -140,12 +141,85 @@ appRoute.use("*", async (c, next) => {
     return c.html("<p>Missing shop parameter. Please open this app from the Shopify admin.</p>", 400);
   }
 
-  const store = await db.query.stores.findFirst({
+  let store = await db.query.stores.findFirst({
     where: eq(stores.shopifyShop, shopDomain),
   });
 
+  // First-time install: store doesn't exist yet. Exchange session token for
+  // an offline access token and create the store + account records.
+  if (!store && idToken && env.SHOPIFY_API_KEY && env.SHOPIFY_API_SECRET) {
+    try {
+      const tokenExchangeResponse = await fetch(
+        `https://${shopDomain}/admin/oauth/access_token`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            client_id: env.SHOPIFY_API_KEY,
+            client_secret: env.SHOPIFY_API_SECRET,
+            grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+            subject_token: idToken,
+            subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+            requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
+          }),
+        },
+      );
+
+      if (tokenExchangeResponse.ok) {
+        const tokenData = (await tokenExchangeResponse.json()) as {
+          access_token: string;
+          scope?: string;
+        };
+
+        // Fetch shop info
+        const shopResponse = await fetch(
+          `https://${shopDomain}/admin/api/${env.SHOPIFY_API_VERSION}/shop.json`,
+          { headers: { "x-shopify-access-token": tokenData.access_token } },
+        );
+        const shopData = shopResponse.ok
+          ? ((await shopResponse.json()) as { shop: { name: string; email: string; domain?: string; primary_domain?: { url?: string } } }).shop
+          : null;
+
+        const email = shopData?.email ?? `${shopDomain}@shop.findable`;
+        const primaryUrl = shopData?.primary_domain?.url
+          ?? (shopData?.domain ? `https://${shopData.domain}` : `https://${shopDomain}`);
+
+        // Find or create account by email
+        let account = await db.query.accounts.findFirst({
+          where: eq(accounts.email, email.trim().toLowerCase()),
+        });
+        if (!account) {
+          const inserted = await db.insert(accounts).values({
+            email: email.trim().toLowerCase(),
+          }).returning();
+          account = inserted[0];
+        }
+
+        // Create store
+        const encryptedToken = encryptShopifyAccessToken(tokenData.access_token);
+        const inserted = await db.insert(stores).values({
+          accountId: account?.id,
+          name: shopData?.name ?? shopDomain,
+          url: primaryUrl,
+          platform: "shopify",
+          shopifyShop: shopDomain,
+          shopifyAccessToken: encryptedToken,
+          shopifyScopes: (tokenData.scope ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+          shopifyInstalledAt: new Date(),
+          productCount: 0,
+        }).returning();
+
+        store = inserted[0];
+      }
+    } catch (e) {
+      console.error("[app] Token exchange failed:", e);
+    }
+  }
+
   if (!store) {
-    return c.html("<p>Store not found. Please reinstall the FindAble app.</p>", 404);
+    // Redirect to OAuth install as fallback
+    const installUrl = `/shopify?shop=${encodeURIComponent(shopDomain)}`;
+    return c.redirect(installUrl);
   }
 
   c.set("shopifyStore", store);
