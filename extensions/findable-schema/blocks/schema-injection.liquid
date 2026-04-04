@@ -1,53 +1,56 @@
-{% comment %}
-  FindAble Schema Injection Block
+{% if template.name == 'product' %}
+  {% assign p = product %}
 
-  Adds to any product page via the theme editor.
-  Fetches pre-generated JSON-LD from FindAble API and injects into the page.
-
-  The block is invisible — no UI rendered. Only schema in <head>.
-
-  Merchant adds this via:
-  Theme Editor → Product Page → Add Block → FindAble JSON-LD
-
-  Also supports collection pages when added there.
-{% endcomment %}
-
-{% if product %}
-  <script
-    id="findable-schema-loader"
-    src="{{ 'findable-loader.js' | asset_url }}"
-    data-product-id="{{ product.id }}"
-    data-product-handle="{{ product.handle }}"
-    data-product-url="{{ product.url | prepend: shop.url }}"
-    data-shop="{{ shop.permanent_domain }}"
-    defer
-  ></script>
-
-  {% comment %}
-    Remove any duplicate Product schema injected by the theme.
-    FindAble's server-generated schema is more complete and correct.
-    Uncomment the block below if merchants report duplicate schema warnings.
-  {% endcomment %}
-  {% comment %}
-  <script data-findable="cleanup">
-    (function() {
-      var scripts = document.querySelectorAll('script[type="application/ld+json"]:not([data-findable])');
-      for (var i = 0; i < scripts.length; i++) {
-        try {
-          var data = JSON.parse(scripts[i].textContent);
-          if (data['@type'] === 'Product' || data['@type'] === 'ProductGroup') {
-            scripts[i].parentNode.removeChild(scripts[i]);
-          }
-        } catch(e) {}
+  {%- comment -%} BASE SCHEMA: rendered server-side via Liquid — instant, no JS needed {%- endcomment -%}
+  <script type="application/ld+json" data-findable="base">
+  {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    "@id": {{ canonical_url | append: "#product" | json }},
+    "name": {{ p.title | json }},
+    "description": {{ p.description | strip_html | truncate: 500 | json }},
+    "url": {{ canonical_url | json }},
+    "image": [
+      {% for image in p.images limit: 5 %}
+        {{ image | image_url: width: 1200 | json }}{% unless forloop.last %},{% endunless %}
+      {% endfor %}
+    ],
+    "brand": {
+      "@type": "Brand",
+      "@id": {{ canonical_url | append: "#brand" | json }},
+      "name": {{ p.vendor | json }}
+    },
+    "sku": {{ p.selected_or_first_available_variant.sku | json }},
+    {% if p.selected_or_first_available_variant.barcode != blank %}
+    "gtin": {{ p.selected_or_first_available_variant.barcode | json }},
+    {% endif %}
+    "offers": {
+      "@type": "Offer",
+      "@id": {{ canonical_url | append: "#offer" | json }},
+      "url": {{ canonical_url | json }},
+      "price": {{ p.selected_or_first_available_variant.price | money_without_currency | json }},
+      "priceCurrency": {{ shop.currency | json }},
+      "availability": "https://schema.org/{% if p.available %}InStock{% else %}OutOfStock{% endif %}",
+      "itemCondition": "https://schema.org/NewCondition",
+      "seller": {
+        "@type": "Organization",
+        "@id": {{ shop.url | append: "#organization" | json }},
+        "name": {{ shop.name | json }}
       }
-    })();
+    }
+  }
   </script>
-  {% endcomment %}
+
+  {%- comment -%} ENHANCED SCHEMA: fetched from FindAble API — adds shipping, returns, FAQ, reviews, etc. {%- endcomment -%}
+  <script type="application/ld+json" data-findable="enhanced" id="findable-enhanced"></script>
+  <script>
+    (async()=>{try{const h={{ product.handle | json }};const s={{ shop.permanent_domain | json }};const r=await fetch('https://api.getfindable.au/api/schema/product?shop='+s+'&handle='+h);if(!r.ok)return;const d=await r.json();if(d.validation&&!d.validation.safe)return;const el=document.getElementById('findable-enhanced');if(el&&d.schemas&&d.schemas.length){el.textContent=JSON.stringify({"@context":"https://schema.org","@graph":d.schemas})}}catch(e){}})();
+  </script>
 {% endif %}
 
 {% schema %}
 {
-  "name": "FindAble JSON-LD",
+  "name": "FindAble Schema",
   "target": "head",
   "settings": []
 }
