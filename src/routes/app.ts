@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, desc, and, sql, inArray, or, lt, isNotNull, gt } from "drizzle-orm";
+import { eq, desc, asc, and, sql, inArray, isNotNull, gt } from "drizzle-orm";
 
 import { db } from "../db/client";
 import { accounts, stores, products, issues, scans, type Store } from "../db/schema";
@@ -14,7 +14,6 @@ import { analyzeWithAi } from "../services/ai-analyzer";
 import type { AiAnalysisInput } from "../services/ai-analyzer";
 import { auditEntityConsistency } from "../services/entity-audit";
 import { detectMismatches } from "../services/mismatch-detector";
-import type { MappedProduct } from "../types/shopify";
 import { env } from "../lib/env";
 
 /* ------------------------------------------------------------------ */
@@ -50,12 +49,20 @@ const FIX_ALL_PRODUCT_LIMIT = 100;
 /* ------------------------------------------------------------------ */
 
 function scoreColor(score: number): string {
-  if (score <= 25) return "#ef4444";
-  if (score <= 40) return "#f97316";
-  if (score <= 55) return "#f59e0b";
-  if (score <= 70) return "#84cc16";
-  if (score <= 85) return "#10b981";
-  return "#06b6d4";
+  if (score < 30) return "#ef4444";
+  if (score < 60) return "#f97316";
+  if (score < 80) return "#eab308";
+  return "#16a34a";
+}
+
+function scoreBadgeHtml(score: number): string {
+  let bg: string;
+  let color: string;
+  if (score < 30) { bg = "#fef2f2"; color = "#dc2626"; }
+  else if (score < 60) { bg = "#fff7ed"; color = "#ea580c"; }
+  else if (score < 80) { bg = "#fefce8"; color = "#a16207"; }
+  else { bg = "#f0fdf4"; color = "#16a34a"; }
+  return `<span style="display:inline-block;padding:2px 10px;border-radius:4px;font-size:12px;font-weight:700;background:${bg};color:${color};">${score}</span>`;
 }
 
 /** Derive a simple feed token from the store UUID (first 16 hex chars). */
@@ -154,6 +161,33 @@ function renderPage(title: string, content: string, apiKey: string): string {
     .health-value { font-size: 24px; font-weight: 700; }
     .health-desc { font-size: 12px; color: #6b7280; margin-top: 4px; }
     .action-status { display: none; margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+    .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; color: white; z-index: 9999; transform: translateY(80px); opacity: 0; transition: transform 0.3s ease, opacity 0.3s ease; }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast-success { background: #16a34a; }
+    .toast-error { background: #dc2626; }
+    .toast-info { background: #2563eb; }
+    .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
+    .spinner-dark { border-color: rgba(0,0,0,0.1); border-top-color: #4f46e5; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .collapsible-toggle { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+    .collapsible-toggle:hover { color: #4f46e5; }
+    .collapsible-content { display: none; }
+    .collapsible-content.open { display: block; }
+    .collapsible-arrow { transition: transform 0.2s; font-size: 12px; }
+    .collapsible-arrow.open { transform: rotate(90deg); }
+    .copy-btn { cursor: pointer; padding: 4px 10px; border: 1px solid #d1d5db; border-radius: 4px; background: white; font-size: 12px; font-weight: 500; color: #374151; white-space: nowrap; }
+    .copy-btn:hover { background: #f9fafb; border-color: #9ca3af; }
+    .product-img { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; flex-shrink: 0; }
+    .fix-btn-inline { padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; border: 1px solid #4f46e5; background: white; color: #4f46e5; white-space: nowrap; }
+    .fix-btn-inline:hover { background: #4f46e5; color: white; }
+    .fix-btn-inline:disabled { opacity: 0.5; cursor: not-allowed; }
+    .score-bar-top { background: white; border-radius: 12px; padding: 12px 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+    .whats-wrong { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 16px; margin-bottom: 8px; }
+    .whats-wrong-title { font-size: 14px; font-weight: 600; color: #dc2626; margin-bottom: 8px; }
+    .whats-wrong-item { font-size: 13px; color: #7f1d1d; line-height: 1.8; }
+    .whats-fixed { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 16px; margin-bottom: 8px; }
+    .whats-fixed-title { font-size: 14px; font-weight: 600; color: #16a34a; margin-bottom: 8px; }
+    .whats-fixed-item { font-size: 13px; color: #14532d; line-height: 1.8; }
   </style>
 </head>
 <body>
@@ -309,6 +343,55 @@ appRoute.use("*", async (c, next) => {
 const APP_JS = `(function() {
   'use strict';
 
+  /* ---- Toast notification system ---- */
+  window.findableToast = function(message, type) {
+    type = type || 'success';
+    var existing = document.querySelector('.toast');
+    if (existing) existing.remove();
+    var toast = document.createElement('div');
+    toast.className = 'toast toast-' + type;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    requestAnimationFrame(function() {
+      requestAnimationFrame(function() { toast.classList.add('show'); });
+    });
+    setTimeout(function() {
+      toast.classList.remove('show');
+      setTimeout(function() { toast.remove(); }, 300);
+    }, 3000);
+  };
+
+  /* ---- Button state helpers ---- */
+  function setBtnLoading(btn, text) {
+    btn.disabled = true;
+    btn.setAttribute('data-original-text', btn.textContent);
+    btn.innerHTML = '<span class="spinner"></span>' + text;
+  }
+  function resetBtn(btn, text) {
+    btn.disabled = false;
+    btn.textContent = text || btn.getAttribute('data-original-text') || 'Action';
+  }
+
+  /* ---- Copy to clipboard ---- */
+  window.findableCopy = function(text, btnEl) {
+    navigator.clipboard.writeText(text).then(function() {
+      var orig = btnEl.textContent;
+      btnEl.textContent = 'Copied!';
+      btnEl.style.color = '#16a34a';
+      window.findableToast('Copied to clipboard', 'success');
+      setTimeout(function() { btnEl.textContent = orig; btnEl.style.color = ''; }, 1500);
+    });
+  };
+
+  /* ---- Collapsible toggle ---- */
+  window.findableToggle = function(id) {
+    var content = document.getElementById(id);
+    var arrow = document.getElementById(id + '-arrow');
+    if (!content) return;
+    content.classList.toggle('open');
+    if (arrow) arrow.classList.toggle('open');
+  };
+
   /* ---- Fix ALL in-app links: add shop param for navigation ---- */
   var shop = new URLSearchParams(window.location.search).get('shop') || '';
   if (shop) {
@@ -327,13 +410,12 @@ const APP_JS = `(function() {
     var status = document.getElementById('sync-status');
     if (!btn || !status) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Syncing...';
+    setBtnLoading(btn, 'Syncing...');
     status.className = 'loading';
     status.textContent = 'Starting product sync...';
+    status.style.display = 'block';
 
     try {
-      // App Bridge automatically adds Authorization: Bearer header
       var res = await fetch('/app/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
@@ -341,18 +423,20 @@ const APP_JS = `(function() {
       var data = await res.json();
       if (res.ok) {
         status.className = 'success';
-        status.textContent = 'Sync started successfully. Products will update shortly.';
+        status.textContent = 'Sync started! Products will update shortly.';
+        window.findableToast('Product sync started', 'success');
       } else {
         status.className = 'error';
         status.textContent = data.error || 'Sync failed. Please try again.';
+        window.findableToast(data.error || 'Sync failed', 'error');
       }
     } catch(e) {
       status.className = 'error';
       status.textContent = 'Network error. Please check your connection.';
+      window.findableToast('Network error', 'error');
     }
 
-    btn.disabled = false;
-    btn.textContent = 'Sync Products';
+    resetBtn(btn, 'Sync Products');
   };
 
   /* ---- Dashboard: scan store ---- */
@@ -361,8 +445,7 @@ const APP_JS = `(function() {
     var status = document.getElementById('sync-status');
     if (!btn || !status) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Scanning...';
+    setBtnLoading(btn, 'Scanning...');
     status.className = 'loading';
     status.textContent = 'Starting store scan...';
     status.style.display = 'block';
@@ -379,7 +462,6 @@ const APP_JS = `(function() {
         status.className = 'loading';
         status.textContent = 'Scanning... 0/' + total + ' products';
 
-        // Poll scan-status every 2 seconds
         var pollInterval = setInterval(async function() {
           try {
             var pollRes = await fetch('/app/scan-status?scanId=' + encodeURIComponent(scanId));
@@ -389,36 +471,34 @@ const APP_JS = `(function() {
               if (s.status === 'complete') {
                 clearInterval(pollInterval);
                 status.className = 'success';
-                status.textContent = 'Scan complete! ' + (s.pagesTotal || total) + ' products scored. Overall: ' + (s.scoreOverall || 0) + '. Reloading...';
-                btn.disabled = false;
-                btn.textContent = 'Scan Store';
+                status.textContent = 'Scan complete! ' + (s.pagesTotal || total) + ' products scored. Overall: ' + (s.scoreOverall || 0) + '.';
+                window.findableToast('Scan complete! Score: ' + (s.scoreOverall || 0), 'success');
+                resetBtn(btn, 'Rescan Store');
                 setTimeout(function() { window.location.reload(); }, 1500);
               } else if (s.status === 'failed') {
                 clearInterval(pollInterval);
                 status.className = 'error';
                 status.textContent = 'Scan failed. Please try again.';
-                btn.disabled = false;
-                btn.textContent = 'Scan Store';
+                window.findableToast('Scan failed', 'error');
+                resetBtn(btn, 'Scan Store');
               } else {
                 status.className = 'loading';
                 status.textContent = 'Scanning... ' + (s.pagesScanned || 0) + '/' + (s.pagesTotal || total) + ' products';
               }
             }
-          } catch(pollErr) {
-            // Ignore transient poll errors
-          }
+          } catch(pollErr) { /* ignore transient */ }
         }, 2000);
       } else {
         status.className = 'error';
         status.textContent = data.error || 'Scan failed. Please try again.';
-        btn.disabled = false;
-        btn.textContent = 'Scan Store';
+        window.findableToast(data.error || 'Scan failed', 'error');
+        resetBtn(btn, 'Scan Store');
       }
     } catch(e) {
       status.className = 'error';
       status.textContent = 'Network error. Please check your connection.';
-      btn.disabled = false;
-      btn.textContent = 'Scan Store';
+      window.findableToast('Network error', 'error');
+      resetBtn(btn, 'Scan Store');
     }
   };
 
@@ -428,8 +508,7 @@ const APP_JS = `(function() {
     var status = document.getElementById('fix-status');
     if (!btn || !status) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Fixing...';
+    setBtnLoading(btn, 'Fixing...');
     status.style.display = 'block';
     status.style.background = '#eff6ff';
     status.style.color = '#2563eb';
@@ -445,20 +524,48 @@ const APP_JS = `(function() {
         status.style.background = '#f0fdf4';
         status.style.color = '#16a34a';
         status.textContent = 'Product fixed! New AEO score: ' + (data.data.aeoScore || 'N/A') + '. Reloading...';
+        window.findableToast('Product fixed! Score: ' + (data.data.aeoScore || 'N/A'), 'success');
         setTimeout(function() { window.location.reload(); }, 1500);
       } else {
         status.style.background = '#fef2f2';
         status.style.color = '#dc2626';
         status.textContent = data.error || 'Auto-fix failed. Please try again.';
+        window.findableToast(data.error || 'Auto-fix failed', 'error');
       }
     } catch(e) {
       status.style.background = '#fef2f2';
       status.style.color = '#dc2626';
       status.textContent = 'Network error. Please check your connection.';
+      window.findableToast('Network error', 'error');
     }
 
-    btn.disabled = false;
-    btn.textContent = 'Auto-Fix This Product';
+    resetBtn(btn, 'Auto-Fix This Product');
+  };
+
+  /* ---- Inline fix from product table ---- */
+  window.findableInlineFix = async function(productId, btnEl) {
+    setBtnLoading(btnEl, 'Fixing...');
+    try {
+      var res = await fetch('/app/products/' + productId + '/fix', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      var data = await res.json();
+      if (res.ok && data.success) {
+        btnEl.textContent = 'Done!';
+        btnEl.style.background = '#16a34a';
+        btnEl.style.color = 'white';
+        btnEl.style.borderColor = '#16a34a';
+        window.findableToast('Product fixed! Score: ' + (data.data.aeoScore || 'N/A'), 'success');
+        setTimeout(function() { window.location.reload(); }, 2000);
+      } else {
+        resetBtn(btnEl, 'Fix');
+        window.findableToast(data.error || 'Fix failed', 'error');
+      }
+    } catch(e) {
+      resetBtn(btnEl, 'Fix');
+      window.findableToast('Network error', 'error');
+    }
   };
 
   /* ---- Product Detail: restore original ---- */
@@ -468,8 +575,7 @@ const APP_JS = `(function() {
     var status = document.getElementById('fix-status');
     if (!btn || !status) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Restoring...';
+    setBtnLoading(btn, 'Restoring...');
     status.style.display = 'block';
     status.style.background = '#eff6ff';
     status.style.color = '#2563eb';
@@ -485,20 +591,22 @@ const APP_JS = `(function() {
         status.style.background = '#f0fdf4';
         status.style.color = '#16a34a';
         status.textContent = 'Restored to original. Reloading...';
+        window.findableToast('Product restored', 'success');
         setTimeout(function() { window.location.reload(); }, 1500);
       } else {
         status.style.background = '#fef2f2';
         status.style.color = '#dc2626';
         status.textContent = data.error || 'Restore failed.';
+        window.findableToast(data.error || 'Restore failed', 'error');
       }
     } catch(e) {
       status.style.background = '#fef2f2';
       status.style.color = '#dc2626';
       status.textContent = 'Network error.';
+      window.findableToast('Network error', 'error');
     }
 
-    btn.disabled = false;
-    btn.textContent = 'Restore Original';
+    resetBtn(btn, 'Restore Original');
   };
 
   /* ---- Dashboard: bulk fix all ---- */
@@ -508,8 +616,7 @@ const APP_JS = `(function() {
     var status = document.getElementById('fix-all-status');
     if (!btn || !status) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Starting...';
+    setBtnLoading(btn, 'Starting...');
     status.style.display = 'block';
     status.style.background = '#eff6ff';
     status.style.color = '#2563eb';
@@ -524,20 +631,22 @@ const APP_JS = `(function() {
       if (res.ok && data.success) {
         status.style.background = '#f0fdf4';
         status.style.color = '#16a34a';
-        status.textContent = 'Bulk fix started for ' + (data.data.productCount || 0) + ' products. Processing in background — results will appear when complete.';
+        status.textContent = 'Bulk fix started for ' + (data.data.productCount || 0) + ' products. Processing in background.';
+        window.findableToast('Bulk fix started for ' + (data.data.productCount || 0) + ' products', 'success');
       } else {
         status.style.background = '#fef2f2';
         status.style.color = '#dc2626';
         status.textContent = data.error || 'Bulk fix failed.';
+        window.findableToast(data.error || 'Bulk fix failed', 'error');
       }
     } catch(e) {
       status.style.background = '#fef2f2';
       status.style.color = '#dc2626';
       status.textContent = 'Network error.';
+      window.findableToast('Network error', 'error');
     }
 
-    btn.disabled = false;
-    btn.textContent = 'Fix All Products';
+    resetBtn(btn, 'Fix All Products');
   };
 
   /* ---- Dashboard: LLM visibility test ---- */
@@ -547,8 +656,7 @@ const APP_JS = `(function() {
     var resultsDiv = document.getElementById('visibility-results');
     if (!btn || !status) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Testing...';
+    setBtnLoading(btn, 'Testing...');
     status.style.display = 'block';
     status.style.background = '#eff6ff';
     status.style.color = '#2563eb';
@@ -556,7 +664,6 @@ const APP_JS = `(function() {
     if (resultsDiv) resultsDiv.innerHTML = '';
 
     try {
-      // Start the test (returns immediately)
       var startRes = await fetch('/app/visibility-test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
@@ -566,7 +673,6 @@ const APP_JS = `(function() {
         throw new Error(errData.error || 'Failed to start test');
       }
 
-      // Poll for results
       status.textContent = 'Running LLM visibility tests (5 prompts)...';
       var report = null;
       for (var attempt = 0; attempt < 30; attempt++) {
@@ -583,53 +689,48 @@ const APP_JS = `(function() {
       }
       if (!report) throw new Error('Test timed out');
 
-      if (true) {
-        var pct = Math.round(report.mentionRate * 100);
-        var color = pct >= 50 ? '#16a34a' : pct >= 20 ? '#d97706' : '#dc2626';
-        status.style.background = '#f0fdf4';
-        status.style.color = '#16a34a';
-        status.textContent = 'Visibility test complete!';
+      var pct = Math.round(report.mentionRate * 100);
+      var color = pct >= 50 ? '#16a34a' : pct >= 20 ? '#d97706' : '#dc2626';
+      status.style.background = '#f0fdf4';
+      status.style.color = '#16a34a';
+      status.textContent = 'Visibility test complete!';
+      window.findableToast('Visibility: ' + pct + '% mention rate', pct >= 50 ? 'success' : 'info');
 
-        if (resultsDiv) {
-          var html = '<div style="margin-top:16px;">';
-          html += '<div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;">';
-          html += '<div style="font-size:48px;font-weight:800;color:' + color + ';">' + pct + '%</div>';
-          html += '<div><div style="font-size:14px;font-weight:600;">LLM Mention Rate</div>';
-          html += '<div style="font-size:12px;color:#6b7280;">Brand &ldquo;' + report.brandName + '&rdquo; mentioned in ' + report.mentionCount + ' of ' + report.testsRun + ' tests</div></div>';
-          html += '</div>';
+      if (resultsDiv) {
+        var html = '<div style="margin-top:16px;">';
+        html += '<div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;">';
+        html += '<div style="font-size:48px;font-weight:800;color:' + color + ';">' + pct + '%</div>';
+        html += '<div><div style="font-size:14px;font-weight:600;">LLM Mention Rate</div>';
+        html += '<div style="font-size:12px;color:#6b7280;">Brand mentioned in ' + report.mentionCount + ' of ' + report.testsRun + ' tests</div></div>';
+        html += '</div>';
 
-          for (var i = 0; i < report.results.length; i++) {
-            var r = report.results[i];
-            var badge = r.mentioned
-              ? '<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">MENTIONED</span>'
-              : '<span style="background:#fef2f2;color:#dc2626;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">NOT FOUND</span>';
-            html += '<div style="background:#f9fafb;border-radius:8px;padding:12px;margin-bottom:8px;">';
-            html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">' + badge;
-            html += '<span style="font-size:13px;color:#374151;font-weight:500;">' + r.prompt + '</span></div>';
-            if (r.mentionContext) {
-              html += '<div style="font-size:12px;color:#4b5563;background:#ecfdf5;padding:8px;border-radius:4px;margin-bottom:4px;">&ldquo;' + r.mentionContext + '&rdquo;</div>';
-            }
-            if (r.competitorsMentioned && r.competitorsMentioned.length > 0) {
-              html += '<div style="font-size:11px;color:#9ca3af;">Competitors mentioned: ' + r.competitorsMentioned.join(', ') + '</div>';
-            }
-            html += '</div>';
+        for (var i = 0; i < report.results.length; i++) {
+          var r = report.results[i];
+          var badge = r.mentioned
+            ? '<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">MENTIONED</span>'
+            : '<span style="background:#fef2f2;color:#dc2626;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">NOT FOUND</span>';
+          html += '<div style="background:#f9fafb;border-radius:8px;padding:12px;margin-bottom:8px;">';
+          html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">' + badge;
+          html += '<span style="font-size:13px;color:#374151;font-weight:500;">' + r.prompt + '</span></div>';
+          if (r.mentionContext) {
+            html += '<div style="font-size:12px;color:#4b5563;background:#ecfdf5;padding:8px;border-radius:4px;margin-bottom:4px;">&ldquo;' + r.mentionContext + '&rdquo;</div>';
+          }
+          if (r.competitorsMentioned && r.competitorsMentioned.length > 0) {
+            html += '<div style="font-size:11px;color:#9ca3af;">Competitors mentioned: ' + r.competitorsMentioned.join(', ') + '</div>';
           }
           html += '</div>';
-          resultsDiv.innerHTML = html;
         }
-      } else {
-        status.style.background = '#fef2f2';
-        status.style.color = '#dc2626';
-        status.textContent = data.error || 'Visibility test failed. Please try again.';
+        html += '</div>';
+        resultsDiv.innerHTML = html;
       }
     } catch(e) {
       status.style.background = '#fef2f2';
       status.style.color = '#dc2626';
-      status.textContent = 'Network error. Please check your connection.';
+      status.textContent = e.message || 'Visibility test failed.';
+      window.findableToast('Visibility test failed', 'error');
     }
 
-    btn.disabled = false;
-    btn.textContent = 'Test LLM Visibility';
+    resetBtn(btn, 'Test LLM Visibility');
   };
 })();
 `;
@@ -1197,7 +1298,6 @@ appRoute.get("/visibility-status", async (c) => {
 appRoute.get("/", async (c) => {
   const store = c.get("shopifyStore");
   const apiKey = env.SHOPIFY_API_KEY ?? "";
-  const frontendUrl = env.FRONTEND_URL;
   const shopDomain = store.shopifyShop ?? store.url ?? "unknown";
   const shopName = shopDomain.replace(/\.myshopify\.com$/, "");
 
@@ -1318,28 +1418,12 @@ appRoute.get("/", async (c) => {
   const overallScore = latestScan?.scoreOverall ?? 0;
 
   // ── Step completion logic ────────────────────────────────────────
+  // Steps are: 1=Sync, 2=Scan, 3=Review, 4=Fix, 5=Schema, 6=Feeds, 7=Monitor
+  // All steps are always accessible (not greyed out). We just track which are done.
 
   const step1Done = productCount > 0;
   const step2Done = !!latestScan;
-  const step3Done = step2Done; // accessible once scan exists
-  const step4Progress = optimizedCount;
-  const step5Done = false; // can't auto-detect
-  const step6Done = false; // informational
-  const step7Done = false; // always accessible
-
-  // Determine which step is "current" (first incomplete)
-  let currentStep = 1;
-  if (step1Done) currentStep = 2;
-  if (step1Done && step2Done) currentStep = 3;
-  if (step1Done && step2Done) currentStep = 4; // Step 4 available after scan — issues are what you fix here
-  if (step1Done && step2Done && step4Progress >= productCount && productCount > 0) currentStep = 5;
-  // Steps 5-7 don't auto-advance; merchant drives them
-  // If step 3 has issues, stay on 3; if no issues, go to 4
-  // Recalculate: step 3 is "review", step 4 is "fix"
-  if (step1Done && step2Done) {
-    currentStep = 4; // After scan, jump to fix step
-    if (step4Progress >= productCount && productCount > 0) currentStep = 5;
-  }
+  const step4AllFixed = optimizedCount >= productCount && productCount > 0;
 
   // ── Feed URLs ────────────────────────────────────────────────────
   const storeToken = feedToken(store.id);
@@ -1349,59 +1433,64 @@ appRoute.get("/", async (c) => {
   const llmsTxtUrl = `https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}`;
 
   // ── Helper to render step state ─────────────────────────────────
-  function stepState(num: number): "done" | "current" | "future" {
-    if (num < currentStep) return "done";
-    if (num === currentStep) return "current";
-    return "future";
+  // All steps are always accessible. We only distinguish done vs not-done.
+  function stepIsDone(num: number): boolean {
+    if (num === 1) return step1Done;
+    if (num === 2) return step2Done;
+    if (num === 3) return step2Done && totalIssues === 0;
+    if (num === 4) return step4AllFixed;
+    return false; // steps 5-7 never auto-complete
   }
 
   function stepCircle(num: number, label: string): string {
-    const state = stepState(num);
-    const bg = state === "done" ? "#16a34a" : state === "current" ? "#4f46e5" : "#d1d5db";
-    const text = state === "done" ? "#fff" : state === "current" ? "#fff" : "#9ca3af";
-    const labelColor = state === "future" ? "#9ca3af" : "#374151";
-    const icon = state === "done"
+    const done = stepIsDone(num);
+    const bg = done ? "#16a34a" : "#4f46e5";
+    const icon = done
       ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`
-      : `<span style="font-size:13px;font-weight:700;color:${text};">${num}</span>`;
+      : `<span style="font-size:13px;font-weight:700;color:#fff;">${num}</span>`;
     return `<div style="display:flex;flex-direction:column;align-items:center;gap:4px;min-width:60px;">
       <div style="width:32px;height:32px;border-radius:50%;background:${bg};display:flex;align-items:center;justify-content:center;">${icon}</div>
-      <span style="font-size:11px;color:${labelColor};font-weight:500;text-align:center;line-height:1.2;">${label}</span>
+      <span style="font-size:11px;color:#374151;font-weight:500;text-align:center;line-height:1.2;">${label}</span>
     </div>`;
   }
 
   function stepConnector(fromNum: number): string {
-    const state = stepState(fromNum);
-    const color = state === "done" ? "#16a34a" : "#e5e7eb";
+    const color = stepIsDone(fromNum) ? "#16a34a" : "#e5e7eb";
     return `<div style="flex:1;height:2px;background:${color};margin-top:16px;min-width:8px;"></div>`;
   }
 
   // ── Step content builders ────────────────────────────────────────
+  // All steps always show their full content (never greyed out).
 
   // Step 1: Sync Products
-  const step1Content = stepState(1) === "done"
-    ? `<div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-size:14px;font-weight:500;">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
-        ${productCount} product${productCount !== 1 ? "s" : ""} synced
-      </div>`
+  const step1Content = step1Done
+    ? `<div style="display:flex;align-items:center;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-size:14px;font-weight:500;flex:1;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          ${productCount} product${productCount !== 1 ? "s" : ""} synced
+        </div>
+        <button class="btn btn-secondary" id="sync-btn" onclick="findableSyncProducts()" style="font-size:13px;padding:6px 14px;">Re-sync</button>
+      </div>
+      <div id="sync-status"></div>`
     : `<div>
         <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Pull your products from Shopify so FindAble can analyze them.</p>
         <button class="btn btn-primary" id="sync-btn" onclick="findableSyncProducts()">Sync Products</button>
         <div id="sync-status"></div>
       </div>`;
 
-  // Step 2: Scan & Score
-  const step2Content = stepState(2) === "done"
-    ? `<div style="display:flex;align-items:center;gap:12px;">
+  // Step 2: Scan & Score — always shows scan button (rescan)
+  const step2Content = step2Done
+    ? `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
         <span style="font-size:32px;font-weight:800;color:${scoreColor(overallScore)};">${overallScore}</span>
-        <span style="color:#6b7280;font-size:14px;">Overall AEO Score</span>
-      </div>`
-    : stepState(2) === "current"
-    ? `<div>
-        <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Analyze your products for AI commerce readiness.</p>
-        <button class="btn btn-primary" id="scan-btn" onclick="findableScanStore()">Scan Store</button>
+        <span style="color:#6b7280;font-size:14px;flex:1;">Overall AEO Score</span>
+        <button class="btn btn-secondary" id="scan-btn" onclick="findableScanStore()" style="font-size:13px;padding:6px 14px;">Rescan</button>
+      </div>
+      <div id="sync-status"></div>`
+    : `<div>
+        <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Analyze your products for AI commerce readiness.${!step1Done ? " Sync products first." : ""}</p>
+        <button class="btn btn-primary" id="scan-btn" onclick="findableScanStore()"${!step1Done ? " disabled" : ""}>Scan Store</button>
         <div id="sync-status"></div>
-      </div>`
-    : `<p style="color:#9ca3af;font-size:14px;margin:0;">Sync products first to unlock scanning.</p>`;
+      </div>`;
 
   // Step 3: Review Issues
   const issuesListHtml = topIssues.length
@@ -1413,9 +1502,9 @@ appRoute.get("/", async (c) => {
         </div>`).join("")
     : "";
 
-  const step3Content = stepState(3) === "future"
-    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Complete a scan first.</p>`
-    : totalIssues === 0 && step2Done
+  const step3Content = !step2Done
+    ? `<p style="color:#6b7280;font-size:14px;margin:0;">Run a scan first to see issues.</p>`
+    : totalIssues === 0
     ? `<div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-size:14px;font-weight:500;">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
         No issues found
@@ -1432,27 +1521,28 @@ appRoute.get("/", async (c) => {
       </div>`;
 
   // Step 4: Fix Products
-  const step4Content = stepState(4) === "future"
-    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Review issues first.</p>`
-    : `<div>
+  const fixPct = productCount > 0 ? Math.round((optimizedCount / productCount) * 100) : 0;
+  const step4Content = `<div>
         <p style="color:#4b5563;font-size:14px;margin:0 0 12px;">Let AI optimize your product data for better discoverability.</p>
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
           <div style="flex:1;background:#e5e7eb;border-radius:99px;height:8px;overflow:hidden;">
-            <div style="width:${productCount > 0 ? Math.round((optimizedCount / productCount) * 100) : 0}%;height:100%;background:#4f46e5;border-radius:99px;transition:width 0.3s;"></div>
+            <div style="width:${fixPct}%;height:100%;background:${step4AllFixed ? "#16a34a" : "#4f46e5"};border-radius:99px;transition:width 0.3s;"></div>
           </div>
           <span style="font-size:13px;font-weight:600;color:#374151;white-space:nowrap;">${optimizedCount} of ${productCount} optimized</span>
         </div>
+        ${step4AllFixed ? `<div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-size:14px;font-weight:500;margin-bottom:12px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          All products optimized! Rescan to see your new scores.
+        </div>` : ""}
         <div style="display:flex;gap:12px;flex-wrap:wrap;">
-          <button class="btn btn-primary" id="fix-all-btn" onclick="findableFixAll()">Auto-Fix All Products</button>
+          <button class="btn btn-primary" id="fix-all-btn" onclick="findableFixAll()"${!step1Done ? " disabled" : ""}>${step4AllFixed ? "Re-Fix All Products" : "Auto-Fix All Products"}</button>
           <a href="/app/products" class="btn btn-secondary">Fix individually</a>
         </div>
         <div id="fix-all-status" class="action-status"></div>
       </div>`;
 
-  // Step 5: Activate Schema
-  const step5Content = stepState(5) === "future"
-    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Fix your products first.</p>`
-    : `<div>
+  // Step 5: Activate Schema — always accessible
+  const step5Content = `<div>
         <p style="color:#4b5563;font-size:14px;margin:0 0 12px;">Enable rich structured data on your store by activating the FindAble app embed in your Shopify theme.</p>
         <ol style="color:#4b5563;font-size:13px;margin:0 0 16px;padding-left:20px;line-height:2;">
           <li>Open your Theme Editor</li>
@@ -1463,16 +1553,14 @@ appRoute.get("/", async (c) => {
         <a href="${themeEditorUrl}" target="_blank" class="btn btn-primary" style="font-size:13px;">Open Theme Editor &rarr;</a>
       </div>`;
 
-  // Step 6: Submit Feeds
-  const step6Content = stepState(6) === "future"
-    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Activate schema first.</p>`
-    : `<div>
+  // Step 6: Submit Feeds — always accessible, with copy buttons
+  const step6Content = `<div>
         <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Get your products into ChatGPT and Google Shopping.</p>
         <div style="margin-bottom:12px;">
           <div style="font-size:12px;font-weight:600;color:#6b7280;margin-bottom:4px;">ACP Feed (ChatGPT)</div>
           <div style="display:flex;gap:8px;align-items:center;">
             <code style="flex:1;background:#f3f4f6;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(acpFeedUrl)}</code>
-            <button class="btn btn-secondary" style="padding:8px 12px;font-size:12px;white-space:nowrap;" onclick="navigator.clipboard.writeText('${acpFeedUrl}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500);">Copy</button>
+            <button class="copy-btn" onclick="findableCopy('${acpFeedUrl}', this)">Copy</button>
           </div>
           <a href="https://chatgpt.com/merchants" target="_blank" style="font-size:12px;color:#4f46e5;text-decoration:none;margin-top:4px;display:inline-block;">Submit to ChatGPT Merchants &rarr;</a>
         </div>
@@ -1480,7 +1568,7 @@ appRoute.get("/", async (c) => {
           <div style="font-size:12px;font-weight:600;color:#6b7280;margin-bottom:4px;">GMC Feed (Google)</div>
           <div style="display:flex;gap:8px;align-items:center;">
             <code style="flex:1;background:#f3f4f6;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(gmcFeedUrl)}</code>
-            <button class="btn btn-secondary" style="padding:8px 12px;font-size:12px;white-space:nowrap;" onclick="navigator.clipboard.writeText('${gmcFeedUrl}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500);">Copy</button>
+            <button class="copy-btn" onclick="findableCopy('${gmcFeedUrl}', this)">Copy</button>
           </div>
           <a href="https://merchants.google.com/" target="_blank" style="font-size:12px;color:#4f46e5;text-decoration:none;margin-top:4px;display:inline-block;">Open Google Merchant Center &rarr;</a>
         </div>
@@ -1488,15 +1576,13 @@ appRoute.get("/", async (c) => {
           <div style="font-size:12px;font-weight:600;color:#6b7280;margin-bottom:4px;">llms.txt</div>
           <div style="display:flex;gap:8px;align-items:center;">
             <code style="flex:1;background:#f3f4f6;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(llmsTxtUrl)}</code>
-            <button class="btn btn-secondary" style="padding:8px 12px;font-size:12px;white-space:nowrap;" onclick="navigator.clipboard.writeText('${llmsTxtUrl}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500);">Copy</button>
+            <button class="copy-btn" onclick="findableCopy('${llmsTxtUrl}', this)">Copy</button>
           </div>
         </div>
       </div>`;
 
-  // Step 7: Monitor
-  const step7Content = stepState(7) === "future"
-    ? `<p style="color:#9ca3af;font-size:14px;margin:0;">Complete earlier steps first.</p>`
-    : `<div>
+  // Step 7: Monitor — always accessible
+  const step7Content = `<div>
         <p style="color:#4b5563;font-size:14px;margin:0 0 16px;">Track your store's AI visibility and health.</p>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;">
           <div style="background:#f9fafb;border-radius:8px;padding:16px;text-align:center;">
@@ -1550,39 +1636,32 @@ appRoute.get("/", async (c) => {
   }
   trackerHtml += `</div>`;
 
-  // Build step cards
+  // Build step cards — all steps always show content, never greyed out
   let stepsHtml = "";
   for (let i = 1; i <= 7; i++) {
-    const state = stepState(i);
-    const borderColor = state === "current" ? "#4f46e5" : state === "done" ? "#e5e7eb" : "#f3f4f6";
-    const bgColor = state === "current" ? "#fafbff" : "#ffffff";
-    const opacity = state === "future" ? "0.6" : "1";
-    const borderWidth = state === "current" ? "2px" : "1px";
+    const done = stepIsDone(i);
+    const borderColor = done ? "#d1fae5" : "#e5e7eb";
+    const bgColor = done ? "#fafffe" : "#ffffff";
 
     stepsHtml += `
-      <div style="border:${borderWidth} solid ${borderColor};border-radius:12px;padding:20px;margin-bottom:12px;background:${bgColor};opacity:${opacity};transition:all 0.2s;">
-        <div style="display:flex;align-items:center;gap:12px;${state !== "current" && state !== "done" ? "cursor:default;" : ""}">
-          <div style="width:28px;height:28px;border-radius:50%;background:${state === "done" ? "#16a34a" : state === "current" ? "#4f46e5" : "#d1d5db"};display:flex;align-items:center;justify-content:center;flex-shrink:0;">
-            ${state === "done"
+      <div style="border:1px solid ${borderColor};border-radius:12px;padding:20px;margin-bottom:12px;background:${bgColor};transition:all 0.2s;">
+        <div style="display:flex;align-items:center;gap:12px;cursor:pointer;" onclick="findableToggle('step-content-${i}')">
+          <div style="width:28px;height:28px;border-radius:50%;background:${done ? "#16a34a" : "#4f46e5"};display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            ${done
               ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`
-              : `<span style="font-size:13px;font-weight:700;color:${state === "current" ? "#fff" : "#9ca3af"};">${i}</span>`}
+              : `<span style="font-size:13px;font-weight:700;color:#fff;">${i}</span>`}
           </div>
           <div style="flex:1;">
-            <div style="font-size:15px;font-weight:600;color:${state === "future" ? "#9ca3af" : "#1a1a1a"};">${stepTitles[i - 1]}</div>
-            ${state !== "current" ? `<div style="font-size:13px;color:#6b7280;margin-top:2px;">${stepDescriptions[i - 1]}</div>` : ""}
+            <div style="font-size:15px;font-weight:600;color:#1a1a1a;">${stepTitles[i - 1]}</div>
+            <div style="font-size:13px;color:#6b7280;margin-top:2px;">${stepDescriptions[i - 1]}</div>
+          </div>
+          <span class="collapsible-arrow" id="step-content-${i}-arrow" style="font-size:18px;color:#6b7280;">&#9654;</span>
+        </div>
+        <div class="collapsible-content" id="step-content-${i}">
+          <div style="margin-top:16px;padding-top:16px;border-top:1px solid #e5e7eb;">
+            ${stepContents[i - 1]}
           </div>
         </div>
-        ${state === "current" ? `
-          <div style="margin-top:16px;padding-top:16px;border-top:1px solid #e5e7eb;">
-            <p style="color:#6b7280;font-size:13px;margin:0 0 16px;">${stepDescriptions[i - 1]}</p>
-            ${stepContents[i - 1]}
-          </div>
-        ` : ""}
-        ${state === "done" ? `
-          <div style="margin-top:8px;padding-left:40px;">
-            ${stepContents[i - 1]}
-          </div>
-        ` : ""}
       </div>`;
   }
 
@@ -1600,6 +1679,12 @@ appRoute.get("/", async (c) => {
     </div>
   ` : "";
 
+  // Auto-expand the first incomplete step (or step 1 if all done)
+  let autoExpandStep = 1;
+  for (let i = 1; i <= 7; i++) {
+    if (!stepIsDone(i)) { autoExpandStep = i; break; }
+  }
+
   const content = `
     <!-- Progress Tracker -->
     <div class="card" style="padding:16px 20px;">
@@ -1610,6 +1695,16 @@ appRoute.get("/", async (c) => {
 
     <!-- Step Cards -->
     ${stepsHtml}
+
+    <script>
+      // Auto-expand the recommended next step
+      (function() {
+        var el = document.getElementById('step-content-${autoExpandStep}');
+        var arrow = document.getElementById('step-content-${autoExpandStep}-arrow');
+        if (el) el.classList.add('open');
+        if (arrow) arrow.classList.add('open');
+      })();
+    </script>
   `;
 
   return c.html(renderPage("Dashboard", content, apiKey));
@@ -1622,9 +1717,17 @@ appRoute.get("/", async (c) => {
 appRoute.get("/products", async (c) => {
   const store = c.get("shopifyStore");
   const apiKey = env.SHOPIFY_API_KEY ?? "";
-  const frontendUrl = env.FRONTEND_URL;
 
-  // Fetch products for this store
+  // Get latest scan for score bar
+  const latestScan = db
+    ? await db.query.scans.findFirst({
+        where: and(eq(scans.storeId, store.id), eq(scans.status, "complete")),
+        orderBy: [desc(scans.completedAt)],
+      })
+    : null;
+  const overallScore = latestScan?.scoreOverall ?? 0;
+
+  // Fetch products for this store — sorted by schema score ascending (worst first)
   const storeProducts = db
     ? await db
         .select({
@@ -1633,10 +1736,12 @@ appRoute.get("/products", async (c) => {
           url: products.url,
           schemaScore: products.schemaScore,
           llmScore: products.llmScore,
+          extractedAttributes: products.extractedAttributes,
+          rewrittenDescription: products.rewrittenDescription,
         })
         .from(products)
         .where(eq(products.storeId, store.id))
-        .orderBy(desc(products.createdAt))
+        .orderBy(asc(products.schemaScore))
         .limit(100)
     : [];
 
@@ -1669,19 +1774,38 @@ appRoute.get("/products", async (c) => {
     const rows = storeProducts
       .map((p) => {
         const name = escapeHtml(p.name ?? "Untitled");
-        const url = escapeHtml(p.url);
         const schema = p.schemaScore ?? 0;
         const llm = p.llmScore ?? 0;
+        const avg = Math.round((schema + llm) / 2);
         const count = issueCounts[p.id] ?? 0;
         const detailUrl = `/app/products/${encodeURIComponent(p.id)}`;
+        const isFixed = !!p.rewrittenDescription;
+
+        // Extract first image from attributes
+        const attrs = (p.extractedAttributes ?? {}) as Record<string, unknown>;
+        const images = (attrs.images as Array<{ url: string }>) ?? [];
+        const imgUrl = images.length > 0 ? images[0]!.url : null;
+        const imgHtml = imgUrl
+          ? `<img src="${escapeHtml(imgUrl)}" alt="" class="product-img" />`
+          : `<div class="product-img" style="background:#f3f4f6;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:16px;">?</div>`;
 
         return `
           <tr>
-            <td><a href="${detailUrl}" style="color: #4f46e5; text-decoration: none; font-weight: 500;">${name}</a></td>
-            <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"><a href="${url}" target="_blank" style="color: #6b7280; text-decoration: none; font-size: 12px;">${url}</a></td>
-            <td><span style="color: ${scoreColor(schema)}; font-weight: 600;">${schema}</span></td>
-            <td><span style="color: ${scoreColor(llm)}; font-weight: 600;">${llm}</span></td>
-            <td>${count > 0 ? `<span style="color: #dc2626; font-weight: 600;">${count}</span>` : '<span style="color: #16a34a;">0</span>'}</td>
+            <td>
+              <div style="display:flex;align-items:center;gap:10px;">
+                ${imgHtml}
+                <a href="${detailUrl}" style="color: #4f46e5; text-decoration: none; font-weight: 500;">${name}</a>
+              </div>
+            </td>
+            <td style="text-align:center;">${scoreBadgeHtml(avg)}</td>
+            <td style="text-align:center;">${scoreBadgeHtml(schema)}</td>
+            <td style="text-align:center;">${scoreBadgeHtml(llm)}</td>
+            <td style="text-align:center;">${count > 0 ? `<span style="color: #dc2626; font-weight: 600;">${count}</span>` : '<span style="color: #16a34a;">0</span>'}</td>
+            <td style="text-align:center;">
+              ${isFixed
+                ? `<span style="color:#16a34a;font-size:12px;font-weight:600;">Fixed</span>`
+                : `<button class="fix-btn-inline" onclick="findableInlineFix('${escapeHtml(p.id)}', this)">Fix</button>`}
+            </td>
           </tr>`;
       })
       .join("");
@@ -1691,10 +1815,11 @@ appRoute.get("/products", async (c) => {
         <thead>
           <tr>
             <th>Product</th>
-            <th>URL</th>
-            <th>Schema</th>
-            <th>LLM</th>
-            <th>Issues</th>
+            <th style="text-align:center;">Score</th>
+            <th style="text-align:center;">Schema</th>
+            <th style="text-align:center;">LLM</th>
+            <th style="text-align:center;">Issues</th>
+            <th style="text-align:center;">Action</th>
           </tr>
         </thead>
         <tbody>
@@ -1703,7 +1828,17 @@ appRoute.get("/products", async (c) => {
       </table>`;
   }
 
+  // Score bar at top
+  const scoreBarHtml = latestScan
+    ? `<div class="score-bar-top">
+        <span style="font-size:28px;font-weight:800;color:${scoreColor(overallScore)};">${overallScore}</span>
+        <span style="font-size:13px;color:#6b7280;">Overall AEO Score</span>
+        <span style="font-size:13px;color:#6b7280;margin-left:auto;">${storeProducts.length} products (sorted worst-first)</span>
+      </div>`
+    : "";
+
   const content = `
+    ${scoreBarHtml}
     <div class="card">
       <h2 class="card-title">Products (${storeProducts.length})</h2>
       ${tableHtml}
@@ -1720,7 +1855,7 @@ appRoute.get("/products", async (c) => {
 appRoute.get("/settings", async (c) => {
   const store = c.get("shopifyStore");
   const apiKey = env.SHOPIFY_API_KEY ?? "";
-  const frontendUrl = env.FRONTEND_URL;
+  const frontendUrl = env.FRONTEND_URL ?? "";
 
   // Look up the account to get the plan
   const account =
@@ -1855,29 +1990,69 @@ appRoute.get("/products/:id", async (c) => {
   const schema = product.schemaScore ?? 0;
   const llm = product.llmScore ?? 0;
   const aeo = product.aeoScore ?? 0;
+  const avgScore = Math.round((schema + llm) / 2);
   const density = product.attributeDensity != null ? Math.round(product.attributeDensity * 100) : 0;
   const descType = product.descriptionType ?? "unknown";
   const missing = product.missingAttributes ?? [];
   const faqs = product.suggestedFaq as Array<{ question: string; answer: string }> | null;
   const generatedSchema = product.generatedSchema;
   const hasBackup = !!(attrs._backup);
+  const isFixed = !!product.rewrittenDescription;
 
   // Description type badge
   const descBadgeClass = descType === "factual" ? "badge-factual" : descType === "marketing" ? "badge-marketing" : "badge-mixed";
 
-  // Issues HTML
+  // Issues HTML — actionable descriptions
   const unfixedIssues = productIssues.filter((i) => !i.fixed);
-  const issuesHtml = unfixedIssues.length > 0
-    ? unfixedIssues.map((issue) => `
-      <div class="issue-row">
-        <span class="severity severity-${issue.severity ?? "medium"}" style="margin-right: 12px;">${escapeHtml(issue.severity ?? "medium")}</span>
-        <span style="flex: 1;">
-          <strong>${escapeHtml(issue.title)}</strong>
-          <div style="font-size: 12px; color: #6b7280; margin-top: 2px;">${escapeHtml(issue.description)}</div>
-        </span>
-        <span style="font-size: 12px; color: #9ca3af;">${escapeHtml(issue.dimension ?? "")}</span>
-      </div>`).join("")
-    : '<div class="empty">No open issues for this product.</div>';
+
+  // Map issue codes to actionable advice
+  function actionableAdvice(title: string): string {
+    const t = title.toLowerCase();
+    if (t.includes("gtin") || t.includes("barcode")) return "Add a barcode/UPC/EAN to this product's variants in Shopify Admin. This is critical for Google Shopping and AI agents to identify your product.";
+    if (t.includes("brand")) return "Set the vendor/brand field in Shopify Admin. AI agents use brand to match purchase intent.";
+    if (t.includes("shipping")) return "Add a shipping policy to your Shopify store (Settings > Policies). FindAble uses this to generate shipping schema.";
+    if (t.includes("return")) return "Add a return/refund policy to your Shopify store (Settings > Policies). Required for Google Shopping and AI commerce.";
+    if (t.includes("review") || t.includes("rating")) return "Install a reviews app (like Judge.me) and collect customer reviews. Reviews with ratings boost AI visibility by 40%.";
+    if (t.includes("json-ld") || t.includes("schema")) return "Run Auto-Fix to generate optimized JSON-LD schema for this product. Then enable the FindAble app embed in your theme.";
+    if (t.includes("description") && t.includes("short")) return "Your product description is too brief for AI agents. Run Auto-Fix to generate an AEO-optimized description with complete factual details.";
+    return title;
+  }
+
+  // "What's Wrong" section — unfixed issues with actionable descriptions
+  const whatsWrongHtml = unfixedIssues.length > 0
+    ? `<div class="card">
+        <h2 class="card-title" style="color:#dc2626;">What's Wrong (${unfixedIssues.length} issues)</h2>
+        ${unfixedIssues.map((issue) => `
+          <div class="whats-wrong" style="margin-bottom:8px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+              <span class="severity severity-${issue.severity ?? "medium"}">${escapeHtml(issue.severity ?? "medium")}</span>
+              <strong style="font-size:14px;">${escapeHtml(issue.title)}</strong>
+              <span style="font-size:11px;color:#9ca3af;margin-left:auto;">${escapeHtml(issue.dimension ?? "")}</span>
+            </div>
+            <div class="whats-wrong-item">${escapeHtml(actionableAdvice(issue.title))}</div>
+          </div>`).join("")}
+      </div>`
+    : `<div class="card">
+        <h2 class="card-title" style="color:#16a34a;">No Issues Found</h2>
+        <p style="color:#4b5563;font-size:14px;margin:0;">This product is in good shape for AI discovery.</p>
+      </div>`;
+
+  // "What FindAble Fixed" section — only show if product has been fixed
+  const whatsFixedItems: string[] = [];
+  if (product.rewrittenDescription) whatsFixedItems.push("Generated AEO-optimized description (factual, no marketing language)");
+  if (generatedSchema) whatsFixedItems.push("Generated complete JSON-LD structured data schema");
+  if (faqs && faqs.length > 0) whatsFixedItems.push(`Generated ${faqs.length} FAQ${faqs.length > 1 ? "s" : ""} for FAQPage schema`);
+  if (product.googleCategory) whatsFixedItems.push(`Mapped to Google category: ${product.googleCategory}`);
+  if (product.descriptionType === "factual") whatsFixedItems.push("Description classified as factual (ACP-compliant)");
+
+  const whatsFixedHtml = whatsFixedItems.length > 0
+    ? `<div class="card">
+        <h2 class="card-title" style="color:#16a34a;">What FindAble Fixed</h2>
+        <div class="whats-fixed">
+          ${whatsFixedItems.map((item) => `<div class="whats-fixed-item">&#10003; ${escapeHtml(item)}</div>`).join("")}
+        </div>
+      </div>`
+    : "";
 
   // Missing attributes HTML
   const missingHtml = missing.length > 0
@@ -1907,85 +2082,86 @@ appRoute.get("/products/:id", async (c) => {
       <a href="/app/products" style="color: #6b7280; text-decoration: none; font-size: 14px;">&larr; Back to Products</a>
     </div>
 
+    <!-- Score bar -->
+    <div class="score-bar-top">
+      <span style="font-size:28px;font-weight:800;color:${scoreColor(avgScore)};">${avgScore}</span>
+      <span style="font-size:13px;color:#6b7280;">Product Score</span>
+      <div style="display:flex;gap:16px;margin-left:auto;">
+        <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:${scoreColor(schema)};">${schema}</div><div style="font-size:10px;color:#6b7280;">Schema</div></div>
+        <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:${scoreColor(llm)};">${llm}</div><div style="font-size:10px;color:#6b7280;">LLM</div></div>
+        <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:${scoreColor(aeo)};">${aeo}</div><div style="font-size:10px;color:#6b7280;">AEO</div></div>
+      </div>
+    </div>
+
     <div class="card">
       <div style="display: flex; gap: 20px; align-items: flex-start;">
         ${imageUrl ? `<img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(product.name ?? "")}" style="width: 100px; height: 100px; object-fit: cover; border-radius: 8px; flex-shrink: 0;" />` : ""}
         <div style="flex: 1;">
           <h2 class="card-title" style="margin-bottom: 8px;">${escapeHtml(product.name ?? "Untitled")}</h2>
           <a href="${escapeHtml(product.url)}" target="_blank" style="color: #6b7280; font-size: 13px; word-break: break-all;">${escapeHtml(product.url)}</a>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+            <span class="badge ${descBadgeClass}">${escapeHtml(descType)} description</span>
+            <span style="font-size:12px;color:#6b7280;">Attribute density: ${density}%</span>
+          </div>
         </div>
       </div>
     </div>
 
-    <div class="card">
-      <h2 class="card-title">Scores</h2>
-      <div class="dimensions">
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(schema)};">${schema}</div>
-          <div class="dim-label">Schema</div>
-        </div>
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(llm)};">${llm}</div>
-          <div class="dim-label">LLM Readiness</div>
-        </div>
-        <div class="dim-card">
-          <div class="dim-score" style="color: ${scoreColor(aeo)};">${aeo}</div>
-          <div class="dim-label">AEO Score</div>
-        </div>
-      </div>
-      <div class="detail-grid" style="margin-top: 16px;">
-        <div class="stat-row">
-          <span class="stat-label">Attribute Density</span>
-          <span class="stat-value">${density}%</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Description Type</span>
-          <span class="badge ${descBadgeClass}">${escapeHtml(descType)}</span>
-        </div>
-      </div>
+    <!-- Actions — prominent at top -->
+    <div class="card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <button class="btn btn-primary" id="fix-btn" onclick="findableAutoFix('${escapeHtml(productId)}')">${isFixed ? "Re-Fix This Product" : "Auto-Fix This Product"}</button>
+      ${hasBackup ? `<button class="btn btn-secondary" id="restore-btn" onclick="findableRestore('${escapeHtml(productId)}')">Restore Original</button>` : ""}
+      <div id="fix-status" class="action-status" style="flex-basis:100%;"></div>
     </div>
 
-    <div class="card">
-      <h2 class="card-title">Issues (${unfixedIssues.length})</h2>
-      ${issuesHtml}
-    </div>
+    ${whatsWrongHtml}
+    ${whatsFixedHtml}
 
     <div class="card">
       <h2 class="card-title">Missing Attributes</h2>
       <div style="margin-top: 8px;">${missingHtml}</div>
     </div>
 
+    <!-- Collapsible: Descriptions (Before/After) -->
     <div class="card">
-      <h2 class="card-title">Descriptions</h2>
-      <div class="side-by-side">
-        <div>
-          <h3 style="font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #6b7280;">Original</h3>
-          <div class="desc-box">${product.originalDescription ? escapeHtml(product.originalDescription) : '<span style="color: #9ca3af;">No original description stored.</span>'}</div>
-        </div>
-        <div>
-          <h3 style="font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #6b7280;">AI-Rewritten (AEO Optimized)</h3>
-          <div class="desc-box">${product.rewrittenDescription ? escapeHtml(product.rewrittenDescription) : '<span style="color: #9ca3af;">No rewritten description yet. Run Auto-Fix to generate.</span>'}</div>
+      <div class="collapsible-toggle" onclick="findableToggle('desc-section')">
+        <h2 class="card-title" style="margin:0;flex:1;">${isFixed ? "Descriptions (Before / After)" : "Description"}</h2>
+        <span class="collapsible-arrow" id="desc-section-arrow">&#9654;</span>
+      </div>
+      <div class="collapsible-content" id="desc-section">
+        <div class="side-by-side" style="margin-top:16px;">
+          <div>
+            <h3 style="font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #6b7280;">Original</h3>
+            <div class="desc-box">${product.originalDescription ? escapeHtml(product.originalDescription) : '<span style="color: #9ca3af;">No original description stored.</span>'}</div>
+          </div>
+          <div>
+            <h3 style="font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #6b7280;">AI-Rewritten (AEO Optimized)</h3>
+            <div class="desc-box">${product.rewrittenDescription ? escapeHtml(product.rewrittenDescription) : '<span style="color: #9ca3af;">No rewritten description yet. Run Auto-Fix to generate.</span>'}</div>
+          </div>
         </div>
       </div>
     </div>
 
+    <!-- Collapsible: FAQs -->
     <div class="card">
-      <h2 class="card-title">Suggested FAQs</h2>
-      ${faqsHtml}
-    </div>
-
-    <div class="card">
-      <h2 class="card-title">Generated Schema (JSON-LD)</h2>
-      ${schemaHtml}
-    </div>
-
-    <div class="card">
-      <h2 class="card-title">Actions</h2>
-      <div class="actions">
-        <button class="btn btn-primary" id="fix-btn" onclick="findableAutoFix('${escapeHtml(productId)}')">Auto-Fix This Product</button>
-        ${hasBackup ? `<button class="btn btn-secondary" id="restore-btn" onclick="findableRestore('${escapeHtml(productId)}')">Restore Original</button>` : ""}
+      <div class="collapsible-toggle" onclick="findableToggle('faq-section')">
+        <h2 class="card-title" style="margin:0;flex:1;">Suggested FAQs${faqs && faqs.length > 0 ? ` (${faqs.length})` : ""}</h2>
+        <span class="collapsible-arrow" id="faq-section-arrow">&#9654;</span>
       </div>
-      <div id="fix-status" class="action-status"></div>
+      <div class="collapsible-content" id="faq-section">
+        <div style="margin-top:16px;">${faqsHtml}</div>
+      </div>
+    </div>
+
+    <!-- Collapsible: Generated Schema -->
+    <div class="card">
+      <div class="collapsible-toggle" onclick="findableToggle('schema-section')">
+        <h2 class="card-title" style="margin:0;flex:1;">Generated Schema (JSON-LD)</h2>
+        <span class="collapsible-arrow" id="schema-section-arrow">&#9654;</span>
+      </div>
+      <div class="collapsible-content" id="schema-section">
+        <div style="margin-top:16px;">${schemaHtml}</div>
+      </div>
     </div>
   `;
 
@@ -2265,6 +2441,37 @@ appRoute.post("/fix-all", async (c) => {
 
         const updatedAttrs = { ...attrs, _backup: backup };
 
+        // Compute updated flags
+        const hasGeneratedSchema = aiResult.generatedSchema != null;
+        const hasGeneratedFaq = Array.isArray(aiResult.suggestedFaq) && aiResult.suggestedFaq.length > 0;
+        const descLen = (aiResult.rewrittenDescription ?? product.originalDescription ?? "").length;
+        const hasShipping = policies.hasShippingPolicy || product.hasShippingSchema;
+        const hasReturn = policies.hasReturnPolicy || product.hasReturnSchema;
+
+        // Re-score with updated flags (same logic as single-product fix)
+        let schemaScore = 18;
+        if (hasGeneratedSchema || product.hasJsonld) schemaScore += 12;
+        if (product.hasGtin) schemaScore += 10;
+        if (product.hasBrand) schemaScore += 8;
+        if (hasShipping) schemaScore += 7;
+        if (hasReturn) schemaScore += 7;
+        if (product.hasReviewSchema) schemaScore += 6;
+        if (hasGeneratedFaq || product.hasFaqSchema) schemaScore += 4;
+        if (product.hasVariantsStructured) schemaScore += 4;
+        schemaScore = Math.min(100, schemaScore);
+
+        let llmScore = 22;
+        llmScore += Math.min(26, Math.floor(descLen / 12));
+        if (product.hasBrand) llmScore += 8;
+        if (hasGeneratedFaq || product.hasFaqSchema) llmScore += 12;
+        if (product.hasMaterial || product.hasColor || product.hasSize) llmScore += 10;
+        if (product.hasReviewSchema) llmScore += 10;
+        llmScore = Math.min(100, llmScore);
+
+        const finalLlmScore = aiResult.aeoScore
+          ? Math.round(aiResult.aeoScore * 0.7 + llmScore * 0.3)
+          : llmScore;
+
         await db!
           .update(products)
           .set({
@@ -2277,8 +2484,14 @@ appRoute.post("/fix-all", async (c) => {
             attributeDensity: aiResult.attributeDensity,
             googleCategory: aiResult.googleCategory,
             extractedAttributes: updatedAttrs,
-            hasShippingSchema: policies.hasShippingPolicy || product.hasShippingSchema,
-            hasReturnSchema: policies.hasReturnPolicy || product.hasReturnSchema,
+            // Updated flags
+            hasJsonld: hasGeneratedSchema || product.hasJsonld,
+            hasFaqSchema: hasGeneratedFaq || product.hasFaqSchema,
+            hasShippingSchema: hasShipping,
+            hasReturnSchema: hasReturn,
+            // Updated scores
+            schemaScore,
+            llmScore: finalLlmScore,
           })
           .where(eq(products.id, pid));
       } catch (err) {
@@ -2305,20 +2518,62 @@ appRoute.get("/setup", async (c) => {
   const apiKey = env.SHOPIFY_API_KEY ?? "";
   const shopDomain = store.shopifyShop ?? store.url ?? "unknown";
   const shopName = shopDomain.replace(/\.myshopify\.com$/, "");
+  const storeUrl = store.url ?? `https://${shopDomain}`;
+
+  // Get latest scan for score bar
+  const latestScan = db
+    ? await db.query.scans.findFirst({
+        where: and(eq(scans.storeId, store.id), eq(scans.status, "complete")),
+        orderBy: [desc(scans.completedAt)],
+      })
+    : null;
+  const overallScore = latestScan?.scoreOverall ?? 0;
+
+  // Check progress for status indicators
+  const productRows = db
+    ? await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(products)
+        .where(eq(products.storeId, store.id))
+    : [];
+  const productCount = productRows[0]?.count ?? 0;
+  const optimizedRows = db
+    ? await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(products)
+        .where(and(eq(products.storeId, store.id), isNotNull(products.rewrittenDescription)))
+    : [];
+  const optimizedCount = optimizedRows[0]?.count ?? 0;
 
   const storeToken = feedToken(store.id);
   const themeEditorUrl = `https://admin.shopify.com/store/${escapeHtml(shopName)}/themes/current/editor?context=apps`;
   const acpFeedUrl = `https://api.getfindable.au/feeds/acp/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}`;
   const gmcFeedUrl = `https://api.getfindable.au/feeds/gmc/${escapeHtml(shopDomain)}?token=${escapeHtml(storeToken)}`;
   const llmsTxtUrl = `https://api.getfindable.au/feeds/llms-txt/${escapeHtml(shopDomain)}`;
+  const richResultsUrl = `https://search.google.com/test/rich-results?url=${encodeURIComponent(storeUrl)}`;
+
+  // Status indicators
+  const doneIcon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5" style="flex-shrink:0;"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+  const todoIcon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2.5" style="flex-shrink:0;"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>`;
+
+  // Score bar at top
+  const scoreBarHtml = latestScan
+    ? `<div class="score-bar-top">
+        <span style="font-size:28px;font-weight:800;color:${scoreColor(overallScore)};">${overallScore}</span>
+        <span style="font-size:13px;color:#6b7280;">Overall AEO Score</span>
+        <span style="font-size:13px;color:#6b7280;margin-left:auto;">${productCount} products, ${optimizedCount} optimized</span>
+      </div>`
+    : "";
 
   const content = `
+    ${scoreBarHtml}
     <div class="card">
       <h2 class="card-title">Setup Guide</h2>
       <p style="color: #6b7280; font-size: 14px; margin: 0 0 20px;">Follow these steps to maximize your store's AI discoverability.</p>
 
       <div class="step-card">
-        <div style="display: flex; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          ${productCount > 0 && optimizedCount > 0 ? doneIcon : todoIcon}
           <span class="step-number">1</span>
           <span class="step-title">Enable Schema Injection</span>
         </div>
@@ -2331,52 +2586,67 @@ appRoute.get("/setup", async (c) => {
       </div>
 
       <div class="step-card">
-        <div style="display: flex; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          ${todoIcon}
           <span class="step-number">2</span>
           <span class="step-title">Submit ACP Feed to ChatGPT</span>
         </div>
         <div class="step-desc">
           Submit your product feed to ChatGPT's merchant program so your products appear in AI shopping recommendations.
-          <div class="code-block">${escapeHtml(acpFeedUrl)}</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <code style="flex:1;background:#1e1e2e;color:#cdd6f4;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(acpFeedUrl)}</code>
+            <button class="copy-btn" onclick="findableCopy('${acpFeedUrl}', this)">Copy</button>
+          </div>
           <br />
           <a href="https://chatgpt.com/merchants" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Go to ChatGPT Merchants &rarr;</a>
         </div>
       </div>
 
       <div class="step-card">
-        <div style="display: flex; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          ${todoIcon}
           <span class="step-number">3</span>
           <span class="step-title">Submit GMC Feed to Google</span>
         </div>
         <div class="step-desc">
           Add this as a <strong>supplemental feed</strong> in Google Merchant Center to enrich your product data with FindAble's optimized attributes.
-          <div class="code-block">${escapeHtml(gmcFeedUrl)}</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <code style="flex:1;background:#1e1e2e;color:#cdd6f4;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(gmcFeedUrl)}</code>
+            <button class="copy-btn" onclick="findableCopy('${gmcFeedUrl}', this)">Copy</button>
+          </div>
           <br />
           <a href="https://merchants.google.com/" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Open Google Merchant Center &rarr;</a>
         </div>
       </div>
 
       <div class="step-card">
-        <div style="display: flex; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          ${todoIcon}
           <span class="step-number">4</span>
           <span class="step-title">Verify Schema</span>
         </div>
         <div class="step-desc">
-          Visit any product page on your store and check the page source for <code>&lt;script type="application/ld+json"&gt;</code> blocks.
-          You can also use Google's Rich Results Test to validate your structured data.
+          Test your store with Google's Rich Results Test to confirm structured data is working.
           <br /><br />
-          <a href="https://search.google.com/test/rich-results" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Google Rich Results Test &rarr;</a>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;">
+            <a href="${escapeHtml(richResultsUrl)}" target="_blank" class="btn btn-primary" style="font-size: 13px; padding: 8px 16px;">Test Schema on ${escapeHtml(shopName)} &rarr;</a>
+            <a href="https://search.google.com/test/rich-results" target="_blank" class="btn btn-secondary" style="font-size: 13px; padding: 8px 16px;">Google Rich Results Test &rarr;</a>
+          </div>
         </div>
       </div>
 
       <div class="step-card">
-        <div style="display: flex; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          ${todoIcon}
           <span class="step-number">5</span>
           <span class="step-title">llms.txt</span>
         </div>
         <div class="step-desc">
           Your <code>llms.txt</code> file tells AI agents what your store offers. Add a link to it from your homepage or navigation footer.
-          <div class="code-block">${escapeHtml(llmsTxtUrl)}</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <code style="flex:1;background:#1e1e2e;color:#cdd6f4;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;">${escapeHtml(llmsTxtUrl)}</code>
+            <button class="copy-btn" onclick="findableCopy('${llmsTxtUrl}', this)">Copy</button>
+          </div>
         </div>
       </div>
     </div>
