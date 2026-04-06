@@ -165,30 +165,25 @@ export interface ShopInfoResponse {
   };
 }
 
-/** Shop policies — shipping, refund, privacy, terms */
+/** Shop policies — uses shopPolicies query (Admin API 2026-04) */
 export const SHOP_POLICIES_QUERY = `
   query ShopPolicies {
-    shop {
-      shippingPolicy { url body }
-      refundPolicy { url body }
-      privacyPolicy { url body }
-      termsOfService { url body }
+    shopPolicies {
+      type
+      url
+      body
     }
   }
 `;
 
-export interface ShopPolicy {
+export interface ShopPolicyNode {
+  type: string;
   url: string | null;
-  body: string | null;
+  body: string;
 }
 
 export interface ShopPoliciesResponse {
-  shop: {
-    shippingPolicy: ShopPolicy | null;
-    refundPolicy: ShopPolicy | null;
-    privacyPolicy: ShopPolicy | null;
-    termsOfService: ShopPolicy | null;
-  };
+  shopPolicies: ShopPolicyNode[];
 }
 
 /** Bulk operation mutation — for stores with 1000+ products */

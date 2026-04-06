@@ -278,20 +278,31 @@ export async function syncSingleProduct(
   return mapped;
 }
 
-/** Fetch store-level policies (shipping, refund, privacy, ToS) from Shopify */
+/** Fetch store-level policies from Shopify Admin API */
 export async function fetchShopPolicies(
   shop: string,
   accessToken: string,
-): Promise<ShopPoliciesResponse["shop"]> {
-  const data = await shopifyGql<ShopPoliciesResponse>(shop, accessToken, SHOP_POLICIES_QUERY);
-  return data.shop;
+): Promise<{ shippingPolicy: { url: string | null; body: string } | null; refundPolicy: { url: string | null; body: string } | null }> {
+  try {
+    const data = await shopifyGql<ShopPoliciesResponse>(shop, accessToken, SHOP_POLICIES_QUERY);
+    const policies = data.shopPolicies ?? [];
+
+    const shipping = policies.find((p) => p.type === "SHIPPING_POLICY") ?? null;
+    const refund = policies.find((p) => p.type === "REFUND_POLICY") ?? null;
+
+    return {
+      shippingPolicy: shipping ? { url: shipping.url, body: shipping.body } : null,
+      refundPolicy: refund ? { url: refund.url, body: refund.body } : null,
+    };
+  } catch (err) {
+    console.error("[fetchShopPolicies] Failed:", err);
+    return { shippingPolicy: null, refundPolicy: null };
+  }
 }
 
 /**
  * Build a complete StoreConfig from a store record + live Shopify policies.
- *
- * Fetches policies from Shopify on the fly so no DB migration is needed.
- * Falls back gracefully if the API call fails.
+ * Falls back gracefully if API calls fail.
  */
 export async function buildStoreConfig(store: Store): Promise<StoreConfig> {
   const config: StoreConfig = {
@@ -314,26 +325,24 @@ export async function buildStoreConfig(store: Store): Promise<StoreConfig> {
         console.error("[buildStoreConfig] Failed to fetch shop info:", err);
       }
 
-      // Fetch policies from Shopify
+      // Fetch policies (never throws — returns nulls on failure)
       const policies = await fetchShopPolicies(store.shopifyShop, accessToken);
 
       if (policies.refundPolicy?.url) {
         config.returnPolicyUrl = policies.refundPolicy.url;
-        // Parse return days from policy body if possible
         const daysMatch = policies.refundPolicy.body?.match(/(\d+)\s*days?/i);
         if (daysMatch) config.returnDays = parseInt(daysMatch[1]!, 10);
-        else config.returnDays = 30; // reasonable default when policy exists but days not parseable
+        else config.returnDays = 30;
         config.returnMethod = "ReturnByMail";
       }
 
       if (policies.shippingPolicy?.url) {
-        // Default shipping estimates for AU stores
         config.shippingRate = "0";
         config.shippingMinDays = 3;
         config.shippingMaxDays = 10;
       }
     } catch (err) {
-      console.error("[buildStoreConfig] Failed to fetch policies:", err);
+      console.error("[buildStoreConfig] Failed:", err);
     }
   }
 
