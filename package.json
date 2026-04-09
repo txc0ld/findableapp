@@ -27,7 +27,7 @@
     "jose": "^6.2.2",
     "openai": "^6.33.0",
     "pg": "^8.14.0",
-    "zod": "^3.24.0"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@shopify/cli": "^3.0.0",
